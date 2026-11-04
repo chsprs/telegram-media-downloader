@@ -33,6 +33,23 @@ Selesai. Bot langsung aktif, link `t.me/<bot_anda>` ditampilkan di akhir.
 sudo BOT_TOKEN="8123456789:AAE..." ALLOWED_USER_IDS="123456789" ./install.sh
 ```
 
+## Kontrol Bot dari Terminal
+
+Setelah install, ada perintah singkat **`tdl`** (tidak perlu sudo — otomatis minta password):
+
+```bash
+tdl on         # nyalakan bot
+tdl off        # matikan bot
+tdl restart    # restart
+tdl status     # cek nyala/mati + autostart
+tdl log        # log realtime (Ctrl+C keluar)
+tdl update     # update bot + yt-dlp, lalu restart
+tdl token      # edit token / whitelist, lalu restart
+tdl help       # daftar perintah
+```
+
+Alias pendek juga jalan: `tdl start`, `tdl stop`, `tdl rs`, `tdl st`, `tdl l`, `tdl up`.
+
 ## Pemakaian
 
 1. Buka bot → `/start`
@@ -43,27 +60,13 @@ sudo BOT_TOKEN="8123456789:AAE..." ALLOWED_USER_IDS="123456789" ./install.sh
 
 Perintah: `/start` (menu) · `/ping` (cek bot hidup)
 
-## Perintah Server
+## Update & Perbaikan
 
 ```bash
-systemctl status telegram-downloader.service   # status
-journalctl -u telegram-downloader.service -f   # log
-sudo systemctl restart telegram-downloader.service
+tdl update     # update bot + yt-dlp, lalu restart otomatis
 ```
 
-**Update:**
-
-```bash
-cd /opt/telegram-media-downloader && git pull
-./venv/bin/pip install -r requirements.txt
-sudo systemctl restart telegram-downloader.service
-```
-
-**Kalau ada situs yang gagal** (situs sumber sering berubah, `yt-dlp` perlu update):
-
-```bash
-./venv/bin/pip install -U yt-dlp && sudo systemctl restart telegram-downloader.service
-```
+Kalau ada situs yang gagal diunduh, itu hampir selalu karena `yt-dlp` ketinggalan versi — `tdl update` sudah mengurus itu.
 
 ## Konfigurasi `.env`
 

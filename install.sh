@@ -109,8 +109,9 @@ EOF
 fi
 
 # ---------------------------------------------------------------- 5. systemd
-log "5/6 Mendaftarkan systemd service..."
+log "5/6 Mendaftarkan systemd service + perintah 'tdl'..."
 install -m 644 telegram-downloader.service /etc/systemd/system/
+install -m 755 "$INSTALL_DIR/tdl" /usr/local/bin/tdl
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 
@@ -134,8 +135,8 @@ echo ""
 echo "=================================================================="
 echo " Instalasi selesai — status service: $STATE"
 [ -n "${BOT_USERNAME:-}" ] && echo " Buka bot: https://t.me/$BOT_USERNAME  lalu kirim /start"
-echo " Log realtime : journalctl -u $SERVICE_NAME -f"
-echo " Restart      : systemctl restart $SERVICE_NAME"
-echo " Edit config  : nano $ENV_FILE"
+echo ""
+echo " Kontrol bot pakai perintah singkat:"
+echo "   tdl on | tdl off | tdl restart | tdl status | tdl log"
 echo "=================================================================="
 [ "$STATE" = "AKTIF" ] || { journalctl -u "$SERVICE_NAME" -n 20 --no-pager; exit 1; }
