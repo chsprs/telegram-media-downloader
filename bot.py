@@ -471,6 +471,11 @@ def menu_markup() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("🏠 Menu", callback_data="menu:help"))
 
 
+def stop_keyboard(req_id: str) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton("⏹ Batalkan unduhan", callback_data=f"stop:{req_id}"))
+
+
 # --- Handlers ---
 WELCOME = (
     "<b>📥 Telegram Media Downloader</b>\n\n"
@@ -579,7 +584,7 @@ def handle_link(message: types.Message):
         message.chat.id, card_caption(job), format_keyboard(req_id, job["est"]), thumb=job.get("thumb"))
 
 
-@bot.callback_query_handler(func=lambda c: c.data.split(":")[0] in ("f", "back", "ok", "x"))
+@bot.callback_query_handler(func=lambda c: c.data.split(":")[0] in ("f", "back", "ok", "x", "stop"))
 def handle_flow(call: types.CallbackQuery):
     if not is_authorized(call.from_user.id):
         bot.answer_callback_query(call.id, "Akses ditolak.", show_alert=True)
@@ -625,6 +630,16 @@ def handle_flow(call: types.CallbackQuery):
         )
         return
 
+    if action == "stop":
+        req_id = parts[1]
+        job = job_cache.get(req_id)
+        if not job or not job.get("cancel"):
+            bot.answer_callback_query(call.id, "Unduhan sudah selesai / tidak aktif.")
+            return
+        job["cancel"].set()
+        bot.answer_callback_query(call.id, "⏹ Menghentikan unduhan...")
+        return
+
     if action == "ok":
         _, mode, req_id = parts
         job = job_cache.get(req_id)
@@ -653,10 +668,14 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
     label = FORMAT_LABEL.get(mode, mode)
     est_size = job.get("est", {}).get(mode) or 0
 
-    bar_msg = bot.send_message(chat_id, "⏳ Memulai...")
+    bar_msg = bot.send_message(chat_id, "⏳ Memulai...", reply_markup=stop_keyboard(req_id))
     state = {"last": 0.0, "last_text": ""}
+    cancel = job.setdefault("cancel", threading.Event())
+    why = {}
+    _active.add(req_id)
 
     def on_progress(d):
+        download_guard(cancel, why)
         if d.get("status") == "downloading":
             now = time.time()
             if now - state["last"] < 3:
@@ -703,6 +722,8 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
 
     try:
         file_path = download_media(job["url"], mode, req_id, on_progress=on_progress)
+        if cancel.is_set():  # hook yt-dlp bisa saja tertelan; cek sekali lagi
+            raise DownloadCancelled("dibatalkan pengguna")
         size = os.path.getsize(file_path)
 
         if size > MAX_TELEGRAM_FILESIZE:
@@ -755,6 +776,21 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
         )
         update_card(job, text, menu_markup())
 
+    except DownloadCancelled:
+        reason = why.get("why", "user")
+        title_html = html.escape(str(job.get("title") or "")[:90])
+        if reason == "disk":
+            bot.edit_message_text(
+                f"❌ <b>Disk penuh</b>\nHapus file lain dulu.\n\n📌 {title_html}",
+                chat_id=chat_id, message_id=bar_msg.message_id)
+            update_card(job, f"❌ <b>Gagal</b>\n\n📌 {title_html}\n\nDisk hampir penuh.", menu_markup())
+        else:
+            bot.edit_message_text(
+                f"⏹ <b>Dibatalkan</b>\n\n📌 {title_html}\n\nKirim link baru kalau mau unduh lagi.",
+                chat_id=chat_id, message_id=bar_msg.message_id)
+            update_card(job, f"❌ <b>Dibatalkan</b>\n\n📌 {title_html}\n\nKirim link baru.", menu_markup())
+        return
+
     except yt_dlp.utils.DownloadError as e:
         logger.warning("download gagal: %s", e)
         error_txt = str(e)[:150]
@@ -781,23 +817,29 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
     finally:
         job["busy"] = False  # Enable concurrent next request if needed
         cleanup(req_id)
+        _active.discard(req_id)
         job_cache.pop(req_id, None)
+
+
+def startup_cleanup() -> int:
+    """Bot baru start = tidak ada unduhan hidup, semua sisa run sebelumnya sampah."""
+    return prune_stale_downloads(0)
 
 
 def _prune_loop():
     while True:
-        time.sleep(1800)
+        time.sleep(PRUNE_INTERVAL_SECONDS)
         try:
-            prune_stale_downloads(3600)
+            prune_stale_downloads(PRUNE_MAX_AGE_SECONDS)
         except Exception:
-            pass
+            logger.exception("prune periodik gagal")
 
 
 def main():
     logger.info("Bot starting (GUI flow)...")
-    pruned = prune_stale_downloads(3600)
+    pruned = startup_cleanup()
     if pruned:
-        logger.info("Startup hygiene: %d stale file(s) dihapus.", pruned)
+        logger.info("Startup hygiene: %d file sisa dihapus.", pruned)
     t = threading.Thread(target=_prune_loop, daemon=True)
     t.start()
     bot.infinity_polling(timeout=20, long_polling_timeout=20)

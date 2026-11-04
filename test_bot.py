@@ -4,6 +4,10 @@ Self-check smoke test untuk telegram-media-downloader.
 Jalankan: python3 test_bot.py
 """
 
+import os
+import sys
+import time
+import threading
 import unittest
 
 from bot import (
@@ -16,6 +20,10 @@ from bot import (
     is_authorized,
     format_keyboard,
     approval_keyboard,
+    download_guard,
+    DownloadCancelled,
+    prune_stale_downloads,
+    startup_cleanup,
 )
 
 
@@ -150,6 +158,39 @@ class TestHelpers(unittest.TestCase):
         self.assertTrue(os.path.exists(new_file))
         # Bersihkan file baru
         os.remove(new_file)
+
+
+class TestDownloadGuard(unittest.TestCase):
+    def test_cancelled_by_user(self):
+        cancel = threading.Event()
+        why = {}
+        try:
+            download_guard(cancel, why)
+        except DownloadCancelled:
+            raise AssertionError("seharusnya tidak raise saat belum dibatalkan")
+        cancel.set()
+        try:
+            download_guard(cancel, why)
+            raise AssertionError("harusnya raise DownloadCancelled")
+        except DownloadCancelled as e:
+            self.assertEqual(why["why"], "user")
+
+
+class TestStartupCleanup(unittest.TestCase):
+    def test_startup_wipes_all(self):
+        old_file = os.path.join("/tmp/tg_media_downloader", "startup_test_old.mp4")
+        # Pastikan ada file dummy lama
+        with open(old_file, "wb") as f:
+            f.write(b"garbage")
+        time_stamp = time.time() - 7200
+        os.utime(old_file, (time_stamp, time_stamp))
+        result = startup_cleanup()
+        self.assertGreater(result, 0)  # minimal satu file terhapus
+        # Bersihkan sisa
+        try:
+            os.remove(old_file)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
