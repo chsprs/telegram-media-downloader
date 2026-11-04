@@ -10,6 +10,7 @@ set -e
 INSTALL_DIR="/opt/telegram-media-downloader"
 SERVICE_NAME="telegram-downloader.service"
 ENV_FILE="$INSTALL_DIR/.env"
+INSTALLER_VERSION="1.3 — prompt token ke stderr, hapus file setelah upload"
 
 TOKEN_BODY='[0-9]{5,}:[A-Za-z0-9_-]{20,}'
 TOKEN_RE="^${TOKEN_BODY}\$"
@@ -21,6 +22,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- 1. dependensi
 log "1/6 Memeriksa & menginstall dependensi sistem (python3, venv, ffmpeg)..."
+log "   installer versi: $INSTALLER_VERSION"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y python3 python3-venv ffmpeg curl >/dev/null
