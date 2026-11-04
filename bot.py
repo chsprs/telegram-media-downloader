@@ -18,9 +18,12 @@ import sys
 import time
 import glob
 import html
+import shutil
 import logging
+import threading
 import urllib.request
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import telebot
 from telebot import types
@@ -55,6 +58,9 @@ if not BOT_TOKEN and __name__ == "__main__":
 token_to_init = BOT_TOKEN if BOT_TOKEN and ":" in BOT_TOKEN else "123456:dummy_test_token"
 bot = telebot.TeleBot(token_to_init, parse_mode="HTML")
 
+# Upload 50 MB di STB lambat: default read timeout 25s bikin ReadTimeout di tengah kirim.
+telebot.apihelper.READ_TIMEOUT = int(os.getenv("TELEGRAM_READ_TIMEOUT", "300"))
+
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USER_IDS", "").strip()
 ALLOWED_USERS = set(int(uid.strip()) for uid in ALLOWED_USERS_RAW.split(",") if uid.strip().isdigit())
 
@@ -63,6 +69,17 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 MAX_TELEGRAM_FILESIZE = 50 * 1024 * 1024  # 50 MB Bot API limit
 URL_REGEX = re.compile(r"https?://[^\s]+")
+
+# ThreadPool bounded: STB ARM (HG680P) CPU lemah, jangan biarkan banyak yt-dlp jalan bareng.
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS)
+
+# Disk guard: eMMC umur pendek, jangan biarkan penuh sampai 95%+ (data rusak / crash).
+MIN_FREE_DISK_MB = int(os.getenv("MIN_FREE_DISK_MB", "512"))
+
+# Storage hygiene: buang sisa unduhan basi tiap interval + saat startup.
+PRUNE_MAX_AGE_SECONDS = int(os.getenv("PRUNE_MAX_AGE_SECONDS", "3600"))
+PRUNE_INTERVAL_SECONDS = int(os.getenv("PRUNE_INTERVAL_SECONDS", "1800"))
 
 FORMAT_LABEL = {
     "v1080": "🎬 Video 1080p (MP4)",
@@ -271,6 +288,60 @@ def cleanup(req_id: str):
             pass
 
 
+# req_id yang masih diproses: jangan sampai pruner menghapus file unduhan yang hidup.
+_active = set()
+
+
+def prune_stale_downloads(max_age_seconds: int = PRUNE_MAX_AGE_SECONDS) -> int:
+    """Bersihkan file sisa unduhan / crash yang berumur > max_age_seconds di DOWNLOAD_DIR."""
+    now = time.time()
+    count = 0
+    if not os.path.exists(DOWNLOAD_DIR):
+        return 0
+    for root_dir, _, filenames in os.walk(DOWNLOAD_DIR):
+        for fn in filenames:
+            if fn.split("_", 1)[0] in _active:
+                continue
+            path = os.path.join(root_dir, fn)
+            try:
+                if now - os.path.getmtime(path) > max_age_seconds:
+                    os.remove(path)
+                    count += 1
+            except OSError:
+                pass
+    if count:
+        logger.info("Pruned %d stale file(s) from %s", count, DOWNLOAD_DIR)
+    return count
+
+
+class DownloadCancelled(Exception):
+    """Unduhan dihentikan: user minta stop atau disk kritis."""
+
+
+def download_guard(cancel: threading.Event, why: dict):
+    """Dipanggil dari progress hook: hentikan unduhan kalau dibatalkan / disk kritis."""
+    if cancel is not None and cancel.is_set():
+        why["why"] = "user"
+        raise DownloadCancelled("dibatalkan pengguna")
+    if shutil.disk_usage(DOWNLOAD_DIR).free < MIN_FREE_DISK_MB * 1024 * 1024:
+        why["why"] = "disk"
+        raise DownloadCancelled("disk hampir penuh")
+
+
+def disk_check(est_bytes: int) -> str:
+    """Pesan error kalau sisa disk tidak cukup; '' kalau aman."""
+    free = shutil.disk_usage(DOWNLOAD_DIR).free
+    need = int(est_bytes or 0) + MIN_FREE_DISK_MB * 1024 * 1024
+    if free >= need:
+        return ""
+    return (
+        f"❌ <b>Ruang disk tidak cukup</b>\n\n"
+        f"Bebas: <b>{human_size(free)}</b>\n"
+        f"Butuh: <b>{human_size(need)}</b>\n\n"
+        f"Hapus file lain atau pilih format lebih kecil."
+    )
+
+
 # --- UI builders ---
 def card_caption(job: dict) -> str:
     title = html.escape(str(job.get("title") or "Tanpa judul")[:120])
@@ -375,16 +446,29 @@ def edit_card(chat_id: int, msg_id: int, text: str, markup=None, is_photo=True):
         return False
 
 
-def send_card(chat_id: int, caption: str, markup, thumb=None) -> int:
-    """Kirim kartu (foto + caption) atau fallback text. Return message_id."""
+def send_card(chat_id: int, caption: str, markup, thumb=None):
+    """Kirim kartu (foto + caption) atau fallback text. Return (message_id, is_photo)."""
     if thumb:
         try:
             msg = bot.send_photo(chat_id, thumb, caption=caption, reply_markup=markup)
-            return msg.message_id
+            return msg.message_id, True
         except Exception:
             pass
     msg = bot.send_message(chat_id, caption, reply_markup=markup, disable_web_page_preview=True)
-    return msg.message_id
+    return msg.message_id, False
+
+
+def update_card(job: dict, text: str, markup=None):
+    """Ubah kartu asal (kartu format/approval) jadi status akhir."""
+    msg_id = job.get("card_msg_id")
+    if not msg_id:
+        return
+    edit_card(job["chat_id"], msg_id, text, markup, bool(job.get("card_is_photo")))
+
+
+def menu_markup() -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton("🏠 Menu", callback_data="menu:help"))
 
 
 # --- Handlers ---
@@ -457,7 +541,7 @@ def handle_link(message: types.Message):
         )
         return
 
-    url = match.group(0)
+    url = match.group(0).rstrip(".,);:!?\"'”’>")
     probe_msg = bot.reply_to(message, "🔍 Mengambil info media...")
 
     try:
@@ -491,7 +575,8 @@ def handle_link(message: types.Message):
     except Exception:
         pass
 
-    send_card(message.chat.id, card_caption(job), format_keyboard(req_id, job["est"]), thumb=job.get("thumb"))
+    job["card_msg_id"], job["card_is_photo"] = send_card(
+        message.chat.id, card_caption(job), format_keyboard(req_id, job["est"]), thumb=job.get("thumb"))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.split(":")[0] in ("f", "back", "ok", "x"))
@@ -529,12 +614,13 @@ def handle_flow(call: types.CallbackQuery):
 
     if action == "x":
         req_id = parts[1]
-        job_cache.pop(req_id, None)
+        job = job_cache.pop(req_id, None) or {}
         bot.answer_callback_query(call.id, "Dibatalkan.")
+        title = html.escape(str(job.get("title") or "Tanpa judul")[:120])
         edit_card(
             chat_id, msg_id,
-            "❌ <b>Unduhan dibatalkan.</b>\n\nKirim link baru kalau mau unduh lagi.",
-            types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 Menu", callback_data="menu:help")),
+            f"❌ <b>Dibatalkan</b>\n\n📌 {title}\n\nKirim link baru kalau mau unduh lagi.",
+            menu_markup(),
             is_photo,
         )
         return
@@ -545,18 +631,30 @@ def handle_flow(call: types.CallbackQuery):
         if not job:
             bot.answer_callback_query(call.id, "Sesi kedaluwarsa. Kirim ulang link.", show_alert=True)
             return
+        if job.get("busy"):
+            bot.answer_callback_query(call.id, "Unduhan ini sedang berjalan.", show_alert=True)
+            return
+        job["busy"] = True
+        warn = disk_check(job.get("est", {}).get(mode) or 0)
+        if warn:
+            job["busy"] = False
+            bot.answer_callback_query(call.id, "Ruang disk tidak cukup.", show_alert=True)
+            update_card(job, warn, menu_markup())
+            return
         bot.answer_callback_query(call.id, "✅ Disetujui, mulai unduh...")
         edit_card(chat_id, msg_id,
                   f"⏳ <b>Menyiapkan unduhan...</b>\n\n{FORMAT_LABEL.get(mode, mode)}", None, is_photo)
-        run_download(chat_id, req_id, job, mode)
+        # Jangan blok polling thread: yt-dlp + upload bisa menit-an.
+        _pool.submit(run_download, chat_id, req_id, job, mode)
 
 
 def run_download(chat_id: int, req_id: str, job: dict, mode: str):
     title_html = html.escape(str(job.get("title") or "")[:90])
     label = FORMAT_LABEL.get(mode, mode)
+    est_size = job.get("est", {}).get(mode) or 0
 
     bar_msg = bot.send_message(chat_id, "⏳ Memulai...")
-    state = {"last": 0.0}
+    state = {"last": 0.0, "last_text": ""}
 
     def on_progress(d):
         if d.get("status") == "downloading":
@@ -569,22 +667,34 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
             pct = (done / total * 100) if total else 0
             speed = d.get("speed") or 0
             eta = d.get("eta") or 0
+            text = (
+                f"⬇️ <b>Mengunduh...</b>\n{title_html}\n\n"
+                f"<code>{progress_bar(pct)}</code> {pct:5.1f}%\n"
+                f"📦 {human_size(done)} / {human_size(total) if total else '?'}\n"
+                f"⚡ {human_size(speed)}/s · ⏳ ETA {fmt_duration(eta)}"
+            )
+            if text == state.get("last_text"):
+                return
+            state["last_text"] = text
             try:
                 bot.edit_message_text(
-                    f"⬇️ <b>Mengunduh...</b>\n{title_html}\n\n"
-                    f"<code>{progress_bar(pct)}</code> {pct:5.1f}%\n"
-                    f"📦 {human_size(done)} / {human_size(total) if total else '?'}\n"
-                    f"⚡ {human_size(speed)}/s · ⏳ ETA {fmt_duration(eta)}",
+                    text,
                     chat_id=chat_id,
                     message_id=bar_msg.message_id,
                 )
             except Exception:
                 pass
         elif d.get("status") == "finished":
+            text = (
+                f"🔄 <b>Memproses file...</b>\n{title_html}\n\n"
+                f"<code>{progress_bar(100)}</code> 100%"
+            )
+            if text == state.get("last_text"):
+                return
+            state["last_text"] = text
             try:
                 bot.edit_message_text(
-                    f"🔄 <b>Memproses file...</b>\n{title_html}\n\n"
-                    f"<code>{progress_bar(100)}</code> 100%",
+                    text,
                     chat_id=chat_id,
                     message_id=bar_msg.message_id,
                 )
@@ -602,6 +712,8 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
                 chat_id=chat_id,
                 message_id=bar_msg.message_id,
             )
+            # Update origin card to failed
+            update_card(job, f"❌ <b>Gagal</b>\n\n📌 {title_html}\n\nFile terlalu besar ({human_size(size)}).\n\nKirim link baru.", menu_markup())
             return
 
         bot.edit_message_text(
@@ -615,8 +727,10 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
 
         with open(file_path, "rb") as fh:
             if mode.startswith("a"):
+                raw_title = str(job.get("title") or "")
+                audio_title = " ".join(raw_title.split())[:60]
                 bot.send_audio(chat_id, fh, caption=caption,
-                               title=str(job.get("title") or "")[:60], duration=duration or None)
+                               title=audio_title, duration=duration or None)
             else:
                 bot.send_video(chat_id, fh, caption=caption, duration=duration or None,
                                supports_streaming=True)
@@ -633,30 +747,59 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
         except Exception:
             pass
 
+        # Update origin card jadi sukses
+        text = (
+            f"✅ <b>Terkirim</b>\n\n"
+            f"📌 {title_html}\n{label}\n💾 {human_size(size)}\n\n"
+            f"Kirim link baru untuk unduh lagi."
+        )
+        update_card(job, text, menu_markup())
+
     except yt_dlp.utils.DownloadError as e:
         logger.warning("download gagal: %s", e)
+        error_txt = str(e)[:150]
         bot.edit_message_text(
-            "❌ <b>Gagal mengunduh</b>\n<code>{}</code>".format(html.escape(str(e)[:200])),
+            f"❌ <b>Gagal mengunduh</b>\n<code>{html.escape(error_txt)}</code>",
             chat_id=chat_id,
             message_id=bar_msg.message_id,
         )
+        # Update origin card to failed
+        update_card(job, f"❌ <b>Gagal</b>\n\n📌 {title_html}\n\n{error_txt}\n\nKirim link baru.", menu_markup())
     except Exception as e:
         logger.exception("error tak terduga")
+        error_txt = str(e)[:150]
         try:
             bot.edit_message_text(
-                "❌ <b>Error internal</b>\n<code>{}</code>".format(html.escape(str(e)[:200])),
+                f"❌ <b>Error internal</b>\n<code>{html.escape(error_txt)}</code>",
                 chat_id=chat_id,
                 message_id=bar_msg.message_id,
             )
         except Exception:
             pass
+        # Update origin card to failed
+        update_card(job, f"❌ <b>Error</b>\n\n📌 {title_html}\n\n{error_txt}\n\nKirim link baru.", menu_markup())
     finally:
+        job["busy"] = False  # Enable concurrent next request if needed
         cleanup(req_id)
         job_cache.pop(req_id, None)
 
 
+def _prune_loop():
+    while True:
+        time.sleep(1800)
+        try:
+            prune_stale_downloads(3600)
+        except Exception:
+            pass
+
+
 def main():
     logger.info("Bot starting (GUI flow)...")
+    pruned = prune_stale_downloads(3600)
+    if pruned:
+        logger.info("Startup hygiene: %d stale file(s) dihapus.", pruned)
+    t = threading.Thread(target=_prune_loop, daemon=True)
+    t.start()
     bot.infinity_polling(timeout=20, long_polling_timeout=20)
 
 

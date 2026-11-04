@@ -90,6 +90,67 @@ class TestHelpers(unittest.TestCase):
         self.assertIn("ok:a192:12345678", adatas)
         self.assertTrue(all(len(d.encode()) <= 64 for d in adatas))
 
+    def test_read_timeout_raised_for_big_uploads(self):
+        import telebot
+        self.assertGreaterEqual(telebot.apihelper.READ_TIMEOUT, 300)
+
+    def test_disk_check(self):
+        from bot import disk_check, MIN_FREE_DISK_MB
+        self.assertEqual(disk_check(0), "")
+        huge = 1 << 60
+        msg = disk_check(huge)
+        self.assertIn("Ruang disk tidak cukup", msg)
+        self.assertIn("Butuh", msg)
+        self.assertGreater(MIN_FREE_DISK_MB, 0)
+
+    def test_download_pool_bounded(self):
+        from bot import _pool, MAX_CONCURRENT_DOWNLOADS
+        self.assertGreaterEqual(MAX_CONCURRENT_DOWNLOADS, 1)
+        self.assertLessEqual(_pool._max_workers, 4)
+
+
+    def test_url_regex_strip_punctuation(self):
+        cases = [
+            ("Link: https://vt.tiktok.com/ZSxyz/.", "https://vt.tiktok.com/ZSxyz/"),
+            ("Cek https://instagram.com/p/123, mantap", "https://instagram.com/p/123"),
+            ("(sumber: https://youtu.be/abc?si=1)", "https://youtu.be/abc?si=1"),
+        ]
+        for text, expected in cases:
+            m = URL_REGEX.search(text)
+            self.assertIsNotNone(m)
+            cleaned = m.group(0).rstrip(".,);:!?\"'”’>")
+            self.assertEqual(cleaned, expected)
+
+    def test_audio_title_clean(self):
+        title = "Judul Video\nMulti line\r\nTest"
+        cleaned = " ".join(title.split())[:60]
+        self.assertEqual(cleaned, "Judul Video Multi line Test")
+        self.assertNotIn("\n", cleaned)
+
+
+    def test_prune_stale_downloads(self):
+        import tempfile, os, time
+        from bot import prune_stale_downloads, DOWNLOAD_DIR
+        # Buat file dummy tua (> 3600s lalu)
+        old_file = os.path.join(DOWNLOAD_DIR, "test_stale_old.mp4")
+        with open(old_file, "wb") as f:
+            f.write(b"old")
+        # Mundurkan mtime ke 2 jam lalu
+        two_hours_ago = time.time() - 7200
+        os.utime(old_file, (two_hours_ago, two_hours_ago))
+
+        # Buat file baru
+        new_file = os.path.join(DOWNLOAD_DIR, "test_stale_new.mp4")
+        with open(new_file, "wb") as f:
+            f.write(b"new")
+
+        pruned = prune_stale_downloads(max_age_seconds=3600)
+        self.assertGreaterEqual(pruned, 1)
+        self.assertFalse(os.path.exists(old_file))
+        self.assertTrue(os.path.exists(new_file))
+        # Bersihkan file baru
+        os.remove(new_file)
+
 
 if __name__ == "__main__":
     unittest.main()
