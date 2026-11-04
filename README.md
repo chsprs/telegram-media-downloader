@@ -59,37 +59,57 @@ cd /opt/telegram-media-downloader
 
 ### 2. Jalankan Script Installer
 
-Script ini otomatis menginstal `ffmpeg`, `python3-venv`, dependensi Python, dan menyiapkan systemd service:
+Installer menanyakan **BOT_TOKEN** langsung (langsung diverifikasi ke Telegram lewat `getMe`), opsional whitelist user ID, lalu menyalakan service otomatis:
 
 ```bash
 sudo ./install.sh
 ```
 
-### 3. Konfigurasi Token Bot
+Contoh prosesnya:
 
-Salin dan sesuaikan konfigurasi `.env`:
-
-```bash
-nano /opt/telegram-media-downloader/.env
+```
+==> 1/6 Memeriksa & menginstall dependensi sistem (python3, venv, ffmpeg)...
+==> 2/6 Menyiapkan direktori aplikasi di /opt/telegram-media-downloader...
+==> 3/6 Menyiapkan Python virtual environment...
+==> 4/6 Konfigurasi bot token
+Masukkan BOT_TOKEN dari @BotFather (contoh 123456789:AAE...): 8123456789:AAE...
+Memverifikasi token ke Telegram... OK (@nama_bot_anda)
+Batasi akses ke user ID tertentu? (kosongkan = publik): 123456789
+==> 5/6 Mendaftarkan systemd service...
+==> 6/6 Menjalankan bot...
+ Instalasi selesai — status service: AKTIF
+ Buka bot: https://t.me/nama_bot_anda  lalu kirim /start
 ```
 
-Isi token dari [@BotFather](https://t.me/BotFather):
+Mode non-interaktif (untuk automation/VPS):
+
+```bash
+sudo BOT_TOKEN="8123456789:AAE..." ALLOWED_USER_IDS="123456789" ./install.sh
+```
+
+Kalau `.env` sudah berisi token valid, installer melewati langkah ini (aman untuk re-run/update).
+
+### 3. Konfigurasi Manual (opsional)
+
+Kalau mau ubah token, whitelist, atau folder temp:
+
+```bash
+sudo nano /opt/telegram-media-downloader/.env
+```
+
 ```env
-BOT_TOKEN=1234567890:ABCdefGhIJKlmNoPQRsTUVwxyZ
+BOT_TOKEN=8123456789:AAE...
 ALLOWED_USER_IDS=123456789
 DOWNLOAD_DIR=/tmp/tg_media_downloader
 ```
-*(Catatan: `ALLOWED_USER_IDS` dapat dikosongkan jika ingin bot bisa digunakan publik).*
+*(`ALLOWED_USER_IDS` kosong = bot publik. Pisahkan dengan koma untuk beberapa user.)*
 
-### 4. Jalankan Service
+Setelah edit, restart: `sudo systemctl restart telegram-downloader.service`
 
-```bash
-sudo systemctl start telegram-downloader.service
-```
-
-Untuk memantau log aplikasi secara realtime:
+### 4. Cek Service & Log
 
 ```bash
+systemctl status telegram-downloader.service
 journalctl -u telegram-downloader.service -f
 ```
 
