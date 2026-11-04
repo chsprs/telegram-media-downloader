@@ -9,11 +9,42 @@ Didesain khusus untuk perangkat hemat daya berdaya komputasi terbatas seperti Li
 ## Fitur Utama
 
 - **Multi-Platform**: Mendukung 1000+ situs web yang didukung oleh `yt-dlp`.
-- **Pilihan Format Interaktif**: Tombol inline untuk memilih unduhan **🎬 Video (MP4)** atau **🎵 Audio (MP3)**.
-- **Hemat Penyimpanan (Disk-Safe)**: File sementara langsung dihapus setelah berhasil terkirim ke Telegram agar eMMC/storage tidak cepat penuh.
-- **Proteksi Ukuran File**: Otomatis mendeteksi limit 50 MB Telegram Bot API sebelum mengirim file.
-- **User Whitelist**: Opsi pembatasan akses (`ALLOWED_USER_IDS`) agar resource STB dan kuota internet tidak disalahgunakan orang lain.
-- **Konsumsi Memori Rendah**: Menggunakan `pyTelegramBotAPI` yang sangat ringan (<30 MB RSS).
+- **Full GUI (Inline Keyboard)**: Seluruh alur pakai tombol — menu, pilih format, konfirmasi, sampai batal. Tanpa perlu mengetik perintah.
+- **Pratinjau Sebelum Unduh**: Kartu info (thumbnail, judul, durasi, views) + estimasi ukuran tiap format.
+- **Approval Gate**: Unduhan baru jalan setelah user menekan **Setujui & Unduh**.
+- **Pilihan Format Lengkap**: Video MP4 1080p / 720p / 480p / terbaik, dan audio MP3 320 / 192 / 128 kbps.
+- **Progress Bar Live**: Persentase, kecepatan, dan ETA saat mengunduh.
+- **Hemat Penyimpanan (Disk-Safe)**: File sementara selalu dihapus (termasuk sisa `.part`) agar eMMC/storage tidak penuh.
+- **Proteksi Ukuran File**: Estimasi > 50 MB ditandai peringatan, file asli dicek ulang sebelum upload.
+- **User Whitelist**: Opsi pembatasan akses (`ALLOWED_USER_IDS`).
+- **Konsumsi Memori Rendah**: `pyTelegramBotAPI` (<30 MB RSS), cocok untuk STB 1 GB.
+
+---
+
+## Alur Pemakaian (Full GUI)
+
+```
+/start  ->  kartu menu  [Kirim Link] [Cara Pakai] [Status Bot]
+   |
+   +- kirim URL
+   |      |
+   |  probe metadata (judul, durasi, thumbnail, estimasi size)
+   |      |
+   |  kartu format:  Video 1080p / 720p / 480p / Terbaik
+   |                  Audio MP3 320 / 192 / 128      [Batal]
+   |      |
+   |  kartu konfirmasi: judul . durasi . format . estimasi size
+   |      [Setujui & Unduh] [Ganti Format] [Batal]
+   |      |
+   |  progress bar live (persen, speed, ETA)
+   |      |
+   +-  file terkirim -> file temp dibersihkan otomatis
+```
+
+Perintah teks (opsional):
+
+- `/start` atau `/help` — tampilkan kartu menu.
+- `/ping` — cek latensi bot.
 
 ---
 
@@ -62,13 +93,26 @@ Untuk memantau log aplikasi secara realtime:
 journalctl -u telegram-downloader.service -f
 ```
 
+### 5. Update ke Versi Terbaru
+
+```bash
+cd /opt/telegram-media-downloader
+git pull
+./venv/bin/pip install -r requirements.txt
+sudo systemctl restart telegram-downloader.service
+```
+
 ---
 
-## Perintah Bot
+## Catatan Teknis
 
-- Kirim link apa saja langsung ke chat bot. Bot akan menampilkan tombol pilihan Video atau Audio MP3.
-- `/start` atau `/help` - Menampilkan panduan penggunaan.
-- `/ping` - Cek koneksi dan latensi bot.
+- Limit upload Bot API Telegram adalah **50 MB**. Untuk file lebih besar, gunakan format yang lebih kecil (480p / MP3 128) atau self-hosted Bot API server.
+- `yt-dlp` perlu di-update berkala karena situs sumber sering berubah:
+  ```bash
+  ./venv/bin/pip install -U yt-dlp
+  sudo systemctl restart telegram-downloader.service
+  ```
+- Sesi (link yang sudah dipilih) disimpan in-memory; restart service akan mengosongkannya.
 
 ---
 
