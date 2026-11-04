@@ -1,0 +1,17 @@
+# Environment & secrets
+.env
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Temporary downloads
+downloads/
+/tmp/tg_media_downloader/
+*.mp4
+*.mp3
+*.m4a
+*.webm

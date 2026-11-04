@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Media Downloader Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/telegram-media-downloader
+ExecStart=/opt/telegram-media-downloader/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target
