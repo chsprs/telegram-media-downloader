@@ -28,8 +28,15 @@ apt-get install -y python3 python3-venv ffmpeg curl >/dev/null
 # ---------------------------------------------------------------- 2. file app
 log "2/6 Menyiapkan direktori aplikasi di $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
-cp -ru ./* "$INSTALL_DIR/" 2>/dev/null || cp -r ./* "$INSTALL_DIR/"
-cd "$INSTALL_DIR"
+SRC_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+DEST_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
+if [ "$SRC_DIR" = "$DEST_DIR" ]; then
+    log "installer dijalankan dari folder instalasi — copy file dilewati"
+else
+    # -u: jangan timpa file yang lebih baru; 2>/dev/null: abaikan "same file"
+    cp -ru "$SRC_DIR"/* "$DEST_DIR"/ 2>/dev/null || true
+fi
+cd "$DEST_DIR"
 
 # ---------------------------------------------------------------- 3. venv
 log "3/6 Menyiapkan Python virtual environment..."
