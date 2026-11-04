@@ -51,7 +51,8 @@ read_token() {
     while :; do
         if [ -z "$t" ]; then
             [ -t 0 ] || die "mode non-interaktif: jalankan dengan BOT_TOKEN=... ./install.sh"
-            printf '\nMasukkan BOT_TOKEN dari @BotFather (contoh 123456789:AAE...): '
+            # prompt WAJIB ke stderr: stdout fungsi ini ditangkap oleh $(...) pemanggil
+            printf '\nMasukkan BOT_TOKEN dari @BotFather (contoh 123456789:AAE...): ' >&2
             read -r t
         fi
         t="$(printf '%s' "$t" | tr -d '[:space:]')"
@@ -59,7 +60,7 @@ read_token() {
             echo "$t"
             return 0
         fi
-        echo "  ! Format token tidak valid. Ambil ulang dari @BotFather (/token)."
+        echo "  ! Format token tidak valid. Ambil ulang dari @BotFather (/token)." >&2
         t=""
         tries=$((tries + 1))
         [ "$tries" -lt 5 ] || die "terlalu banyak percobaan token."
@@ -68,14 +69,19 @@ read_token() {
 
 verify_token() {
     local token="$1" resp
-    resp="$(curl -s --max-time 12 "https://api.telegram.org/bot${token}/getMe" || true)"
+    resp="$(curl -s --max-time 12 "https://api.telegram.org/bot${token}/getMe" 2>/dev/null)"
     case "$resp" in
         *'"ok":true'*)
             echo "$resp" | grep -o '"username":"[^"]*"' | head -1 | cut -d'"' -f4
             return 0
             ;;
-        *) return 1 ;;
     esac
+    if [ -z "$resp" ]; then
+        echo "  ! Tidak bisa menghubungi api.telegram.org (cek koneksi / DNS server)." >&2
+    else
+        echo "  ! Ditolak Telegram: $(printf '%s' "$resp" | grep -o '"description":"[^"]*"' | cut -d'"' -f4)" >&2
+    fi
+    return 1
 }
 
 if [ -f "$ENV_FILE" ] && grep -qE "^BOT_TOKEN=${TOKEN_BODY}\$" "$ENV_FILE" && [ -z "${BOT_TOKEN:-}" ]; then

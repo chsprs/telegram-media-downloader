@@ -621,6 +621,13 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
                 bot.send_video(chat_id, fh, caption=caption, duration=duration or None,
                                supports_streaming=True)
 
+        # File sudah terkirim ke user -> hapus dari penyimpanan bot
+        try:
+            os.remove(file_path)
+            logger.info("file terkirim & dihapus: %s", file_path)
+        except OSError as e:
+            logger.warning("gagal hapus %s: %s", file_path, e)
+
         try:
             bot.delete_message(chat_id, bar_msg.message_id)
         except Exception:
