@@ -177,6 +177,36 @@ def head_size(url) -> int:
 
 
 # --- yt-dlp ---
+# TikTok/SNS sering balas halaman tanpa blob rehydration atau 429 sesaat: satu percobaan gagal
+# bukan berarti link rusak, jadi ulangi dengan backoff sebelum menyerah.
+TRANSIENT_MARKERS = (
+    "unable to extract", "unexpected response", "timed out", "timeout",
+    "429", "too many requests", "temporarily", "connection reset",
+    "connection aborted", "no video formats found", "unable to download webpage",
+)
+
+
+def _is_transient(exc) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in TRANSIENT_MARKERS)
+
+
+def _ydl_retry(opts: dict, url: str, download: bool, attempts: int = 3, base_delay: float = 2.0):
+    last = None
+    for i in range(attempts):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=download)
+        except Exception as e:
+            last = e
+            if i == attempts - 1 or not _is_transient(e):
+                raise
+            time.sleep(base_delay * (i + 1))
+            logger.info("yt-dlp gagal sesaat (%s) - percobaan ulang %d/%d",
+                        str(e)[:60], i + 1, attempts - 1)
+    raise last
+
+
 def probe(url: str) -> dict:
     """Ambil metadata tanpa mengunduh."""
     opts = {
@@ -186,8 +216,7 @@ def probe(url: str) -> dict:
         "noplaylist": True,
         "socket_timeout": 20,
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info = _ydl_retry(opts, url, download=False)
 
     if info.get("entries"):
         entries = [e for e in info["entries"] if e]
@@ -275,9 +304,7 @@ def download_media(url: str, mode: str, req_id: str, on_progress=None) -> str:
         opts["format"] = VIDEO_SELECTOR.get(mode, VIDEO_SELECTOR["vbest"])
         opts["merge_output_format"] = "mp4"
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
-
+    _ydl_retry(opts, url, download=True)
     files = [
         f for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{req_id}_*"))
         if not f.endswith((".part", ".ytdl", ".temp", ".jpg", ".webp", ".png"))

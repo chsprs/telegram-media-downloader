@@ -277,5 +277,90 @@ class TestStartupCleanup(unittest.TestCase):
             B._guard_disk_ts[0] = real_ts[0]
 
 
+    def test_ydl_retry_transient_then_ok(self):
+        import bot as B
+        calls = []
+
+        class FakeYDL:
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=False):
+                calls.append(url)
+                if len(calls) < 3:
+                    raise B.yt_dlp.utils.DownloadError(
+                        "Unable to extract universal data for rehydration")
+                return {"id": "ok"}
+
+        real = B.yt_dlp.YoutubeDL
+        B.yt_dlp.YoutubeDL = FakeYDL
+        try:
+            info = B._ydl_retry({}, "u", download=True, attempts=3, base_delay=0)
+            self.assertEqual(info["id"], "ok")
+            self.assertEqual(len(calls), 3)
+        finally:
+            B.yt_dlp.YoutubeDL = real
+
+    def test_ydl_retry_fatal_not_retried(self):
+        import bot as B
+        calls = []
+
+        class FakeYDL:
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=False):
+                calls.append(url)
+                raise B.yt_dlp.utils.DownloadError("This video is private")
+
+        real = B.yt_dlp.YoutubeDL
+        B.yt_dlp.YoutubeDL = FakeYDL
+        try:
+            with self.assertRaises(B.yt_dlp.utils.DownloadError):
+                B._ydl_retry({}, "u", download=True, attempts=3, base_delay=0)
+            self.assertEqual(len(calls), 1)
+        finally:
+            B.yt_dlp.YoutubeDL = real
+
+    def test_cancel_not_retried(self):
+        import bot as B
+        calls = []
+
+        class FakeYDL:
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=False):
+                calls.append(url)
+                raise B.DownloadCancelled("dibatalkan pengguna")
+
+        real = B.yt_dlp.YoutubeDL
+        B.yt_dlp.YoutubeDL = FakeYDL
+        try:
+            with self.assertRaises(B.DownloadCancelled):
+                B._ydl_retry({}, "u", download=True, attempts=3, base_delay=0)
+            self.assertEqual(len(calls), 1)
+        finally:
+            B.yt_dlp.YoutubeDL = real
+
+
 if __name__ == "__main__":
     unittest.main()
