@@ -193,5 +193,89 @@ class TestStartupCleanup(unittest.TestCase):
             pass
 
 
+    def test_req_id_unique(self):
+        from bot import new_req_id
+        ids = {new_req_id() for _ in range(2000)}
+        self.assertEqual(len(ids), 2000)
+        for rid in list(ids)[:50]:
+            self.assertEqual(len(rid), 10)
+            self.assertTrue(rid.isalnum())
+
+    def test_download_media_picks_largest_file(self):
+        import os, glob as _glob
+        import bot as B
+
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=True):
+                rid = os.path.basename(self.opts["outtmpl"]).split("_", 1)[0]
+                for name, size in ((f"{rid}_x.webm", 100), (f"{rid}_x.mp4", 5000),
+                                   (f"{rid}_x.mp4.part", 1)):
+                    with open(os.path.join(B.DOWNLOAD_DIR, name), "wb") as fh:
+                        fh.write(b"0" * size)
+                return {"id": "x"}
+
+        real = B.yt_dlp.YoutubeDL
+        B.yt_dlp.YoutubeDL = FakeYDL
+        try:
+            rid = B.new_req_id()
+            path = B.download_media("u", "v720", rid)
+            self.assertTrue(path.endswith(".mp4"))
+            self.assertEqual(os.path.getsize(path), 5000)
+        finally:
+            B.yt_dlp.YoutubeDL = real
+            B.cleanup(rid)
+
+    def test_probe_inflight_released_on_failure(self):
+        import bot as B
+        sent = []
+        real_edit = B.bot.edit_message_text
+        real_probe = B.probe
+        B.bot.edit_message_text = lambda *a, **k: sent.append(a)
+        B.probe = lambda url: (_ for _ in ()).throw(RuntimeError("boom"))
+
+        class M:
+            chat = type("C", (), {"id": 1})()
+            message_id = 2
+
+        try:
+            B._probes_inflight.add(999)
+            B._probe_and_send(1, 999, "u", M())
+            self.assertNotIn(999, B._probes_inflight)
+            self.assertTrue(sent)
+        finally:
+            B.bot.edit_message_text = real_edit
+            B.probe = real_probe
+            B._probes_inflight.discard(999)
+
+    def test_download_guard_disk_check_throttled(self):
+        import bot as B
+        calls = []
+        real_usage = B.shutil.disk_usage
+        real_ts = list(B._guard_disk_ts)
+
+        class DU:
+            free = 10 ** 12
+
+        B.shutil.disk_usage = lambda p: (calls.append(1), DU)[1]
+        try:
+            B._guard_disk_ts[0] = 0.0
+            B.download_guard(None, {})
+            B.download_guard(None, {})
+            B.download_guard(None, {})
+            self.assertEqual(len(calls), 1)
+        finally:
+            B.shutil.disk_usage = real_usage
+            B._guard_disk_ts[0] = real_ts[0]
+
+
 if __name__ == "__main__":
     unittest.main()

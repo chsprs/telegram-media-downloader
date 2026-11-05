@@ -22,6 +22,7 @@ import shutil
 import logging
 import threading
 import urllib.request
+import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -67,7 +68,8 @@ ALLOWED_USERS = set(int(uid.strip()) for uid in ALLOWED_USERS_RAW.split(",") if 
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/tg_media_downloader")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-MAX_TELEGRAM_FILESIZE = 50 * 1024 * 1024  # 50 MB Bot API limit
+MAX_UPLOAD_MB = max(1, int(os.getenv("MAX_UPLOAD_MB", "50")))
+MAX_TELEGRAM_FILESIZE = MAX_UPLOAD_MB * 1024 * 1024  # default aman 50 MB; Bot API terima lebih
 URL_REGEX = re.compile(r"https?://[^\s]+")
 
 # ThreadPool bounded: STB ARM (HG680P) CPU lemah, jangan biarkan banyak yt-dlp jalan bareng.
@@ -157,7 +159,9 @@ def progress_bar(pct: float, width: int = 14) -> str:
 
 
 def new_req_id() -> str:
-    return str(int(time.time() * 1000))[-8:]
+    # uuid, bukan timestamp: dua request pada milidetik sama tidak boleh menabrak
+    # (job_cache tertimpa + cleanup() menghapus file milik user lain).
+    return uuid.uuid4().hex[:10]
 
 
 def head_size(url) -> int:
@@ -274,10 +278,14 @@ def download_media(url: str, mode: str, req_id: str, on_progress=None) -> str:
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.extract_info(url, download=True)
 
-    files = [f for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{req_id}_*")) if not f.endswith(".part")]
+    files = [
+        f for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{req_id}_*"))
+        if not f.endswith((".part", ".ytdl", ".temp", ".jpg", ".webp", ".png"))
+    ]
     if not files:
         raise yt_dlp.utils.DownloadError("File hasil unduhan tidak ditemukan.")
-    return files[0]
+    # hasil merge/postprocess = file terbesar; jangan ambil sisa stream audio/webm
+    return max(files, key=os.path.getsize)
 
 
 def cleanup(req_id: str):
@@ -290,6 +298,8 @@ def cleanup(req_id: str):
 
 # req_id yang masih diproses: jangan sampai pruner menghapus file unduhan yang hidup.
 _active = set()
+# user yang sedang di-probe: cegah satu user membanjiri antrean pool.
+_probes_inflight = set()
 
 
 def prune_stale_downloads(max_age_seconds: int = PRUNE_MAX_AGE_SECONDS) -> int:
@@ -318,11 +328,19 @@ class DownloadCancelled(Exception):
     """Unduhan dihentikan: user minta stop atau disk kritis."""
 
 
+_guard_disk_ts = [0.0]
+
+
 def download_guard(cancel: threading.Event, why: dict):
     """Dipanggil dari progress hook: hentikan unduhan kalau dibatalkan / disk kritis."""
     if cancel is not None and cancel.is_set():
         why["why"] = "user"
         raise DownloadCancelled("dibatalkan pengguna")
+    # hook yt-dlp dipanggil ratusan kali/detik: cek disk maksimal tiap 2 detik.
+    now = time.time()
+    if now - _guard_disk_ts[0] < 2.0:
+        return
+    _guard_disk_ts[0] = now
     if shutil.disk_usage(DOWNLOAD_DIR).free < MIN_FREE_DISK_MB * 1024 * 1024:
         why["why"] = "disk"
         raise DownloadCancelled("disk hampir penuh")
@@ -547,41 +565,65 @@ def handle_link(message: types.Message):
         return
 
     url = match.group(0).rstrip(".,);:!?\"'”’>")
-    probe_msg = bot.reply_to(message, "🔍 Mengambil info media...")
 
-    try:
-        info = probe(url)
-    except Exception as e:
-        logger.warning("probe gagal: %s", e)
-        bot.edit_message_text(
-            "❌ Gagal membaca link.\n<code>{}</code>\n\n"
-            "Pastikan link publik (bukan private/login-only).".format(html.escape(str(e)[:200])),
-            chat_id=probe_msg.chat.id,
-            message_id=probe_msg.message_id,
-        )
+    user_id = message.from_user.id
+    if user_id in _probes_inflight:
+        bot.reply_to(message, "⏳ Masih memproses permintaan sebelumnya. Tunggu sampai kartunya muncul.")
         return
 
-    req_id = new_req_id()
-    job = {
-        "url": url,
-        "title": info.get("title") or info.get("description") or "Tanpa judul",
-        "uploader": info.get("uploader") or info.get("channel") or info.get("uploader_id"),
-        "duration": info.get("duration") or 0,
-        "view_count": info.get("view_count") or 0,
-        "thumb": info.get("thumbnail"),
-        "est": estimate_sizes(info),
-        "chat_id": message.chat.id,
-        "user_id": message.from_user.id,
-    }
-    job_cache.set(req_id, job)
+    probe_msg = bot.reply_to(message, "🔍 Mengambil info media...")
+    _probes_inflight.add(user_id)
+    # yt-dlp 10-30s: jangan blok thread polling, kalau tidak bot beku untuk semua user.
+    _pool.submit(_probe_and_send, message.chat.id, user_id, url, probe_msg)
 
+
+def _probe_and_send(chat_id: int, user_id: int, url: str, probe_msg):
     try:
-        bot.delete_message(probe_msg.chat.id, probe_msg.message_id)
-    except Exception:
-        pass
+        try:
+            info = probe(url)
+        except Exception as e:
+            logger.warning("probe gagal: %s", e)
+            bot.edit_message_text(
+                "❌ Gagal membaca link.\n<code>{}</code>\n\n"
+                "Pastikan link publik (bukan private/login-only).".format(html.escape(str(e)[:200])),
+                chat_id=probe_msg.chat.id,
+                message_id=probe_msg.message_id,
+            )
+            return
 
-    job["card_msg_id"], job["card_is_photo"] = send_card(
-        message.chat.id, card_caption(job), format_keyboard(req_id, job["est"]), thumb=job.get("thumb"))
+        req_id = new_req_id()
+        job = {
+            "url": url,
+            "title": info.get("title") or info.get("description") or "Tanpa judul",
+            "uploader": info.get("uploader") or info.get("channel") or info.get("uploader_id"),
+            "duration": info.get("duration") or 0,
+            "view_count": info.get("view_count") or 0,
+            "thumb": info.get("thumbnail"),
+            "est": estimate_sizes(info),
+            "chat_id": chat_id,
+            "user_id": user_id,
+        }
+        job_cache.set(req_id, job)
+
+        try:
+            bot.delete_message(probe_msg.chat.id, probe_msg.message_id)
+        except Exception:
+            pass
+
+        job["card_msg_id"], job["card_is_photo"] = send_card(
+            chat_id, card_caption(job), format_keyboard(req_id, job["est"]), thumb=job.get("thumb"))
+    except Exception as e:
+        logger.exception("probe worker error")
+        try:
+            bot.edit_message_text(
+                "❌ <b>Error internal</b>\n<code>{}</code>".format(html.escape(str(e)[:150])),
+                chat_id=probe_msg.chat.id,
+                message_id=probe_msg.message_id,
+            )
+        except Exception:
+            pass
+    finally:
+        _probes_inflight.discard(user_id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.split(":")[0] in ("f", "back", "ok", "x", "stop"))
@@ -620,6 +662,10 @@ def handle_flow(call: types.CallbackQuery):
     if action == "x":
         req_id = parts[1]
         job = job_cache.pop(req_id, None) or {}
+        cancel = job.get("cancel")
+        if cancel is not None:
+            cancel.set()
+        cleanup(req_id)  # buang sisa file kalau user batal setelah unduhan mulai
         bot.answer_callback_query(call.id, "Dibatalkan.")
         title = html.escape(str(job.get("title") or "Tanpa judul")[:120])
         edit_card(
