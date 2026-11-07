@@ -369,6 +369,25 @@ class TestStartupCleanup(unittest.TestCase):
         finally:
             B.yt_dlp.YoutubeDL = real
 
+    def test_fast_upload_parallel_parts(self):
+        import asyncio
+        import bot as B
+        sent_reqs = []
+
+        async def fake_call(req):
+            sent_reqs.append(req)
+
+        test_file = os.path.join(B.DOWNLOAD_DIR, "test_fast_up.dat")
+        with open(test_file, "wb") as f:
+            f.write(b"X" * (1024 * 600))  # 600 KB -> 2 parts
+        try:
+            res = asyncio.run(B.fast_upload(fake_call, test_file, max_workers=2))
+            self.assertEqual(len(sent_reqs), 2)
+            self.assertEqual(res.parts, 2)
+        finally:
+            if os.path.exists(test_file):
+                os.remove(test_file)
+
 
 if __name__ == "__main__":
     unittest.main()

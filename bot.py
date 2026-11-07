@@ -23,11 +23,13 @@ import asyncio
 import threading
 import urllib.request
 import uuid
+import math
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-from telethon import TelegramClient, events, Button
-from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
+from telethon import TelegramClient, events, Button, helpers
+from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo, InputFileBig, InputFile
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 import yt_dlp
 
 # --- Logging ---
@@ -708,6 +710,58 @@ async def handle_flow(event):
         asyncio.create_task(run_download(chat_id, req_id, job, mode))
 
 
+async def fast_upload(client, file_path: str, progress_callback=None, max_workers: int = 4):
+    """Unggah file secara paralel 4 chunk MTProto 512KB bersamaan (memaksimalkan bandwidth upload)."""
+    file_size = os.path.getsize(file_path)
+    file_id = helpers.generate_random_long()
+    is_big = file_size > 10 * 1024 * 1024
+    part_size = 512 * 1024
+    total_parts = math.ceil(file_size / part_size) or 1
+    file_name = os.path.basename(file_path)
+
+    uploaded = 0
+    lock = asyncio.Lock()
+    queue = asyncio.Queue()
+    for i in range(total_parts):
+        queue.put_nowait(i)
+
+    async def worker():
+        nonlocal uploaded
+        with open(file_path, "rb") as f:
+            while not queue.empty():
+                try:
+                    part_index = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                f.seek(part_index * part_size)
+                chunk = f.read(part_size)
+                if is_big:
+                    req = SaveBigFilePartRequest(file_id, part_index, total_parts, chunk)
+                else:
+                    req = SaveFilePartRequest(file_id, part_index, chunk)
+                await client(req)
+                async with lock:
+                    uploaded += len(chunk)
+                    if progress_callback:
+                        progress_callback(uploaded, file_size)
+                queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(min(max_workers, total_parts))]
+    await asyncio.gather(*workers)
+
+    if is_big:
+        return InputFileBig(file_id, total_parts, file_name)
+    return InputFile(file_id, total_parts, file_name, md5_checksum="")
+
+
+async def parallel_upload_with_fallback(client, file_path: str, progress_callback=None):
+    try:
+        return await fast_upload(client, file_path, progress_callback=progress_callback, max_workers=4)
+    except Exception as e:
+        logger.warning("fast_upload gagal (%s), fallback ke upload bawaan telethon", e)
+        return await client.upload_file(file_path, progress_callback=progress_callback)
+
+
 async def run_download(chat_id: int, req_id: str, job: dict, mode: str):
     title_html = html.escape(str(job.get("title") or "")[:90])
     label = FORMAT_LABEL.get(mode, mode)
@@ -800,19 +854,21 @@ async def run_download(chat_id: int, req_id: str, job: dict, mode: str):
                 loop,
             )
 
+        # Upload file secara paralel (Fast MTProto)
+        input_file = await parallel_upload_with_fallback(client, file_path, progress_callback=upload_callback)
+
         if mode.startswith("a"):
             raw_title = str(job.get("title") or "")
             audio_title = " ".join(raw_title.split())[:60]
             attr = [DocumentAttributeAudio(duration=duration, title=audio_title, performer=str(job.get("uploader") or ""))]
             await client.send_file(
-                chat_id, file_path, caption=caption, parse_mode="html",
-                attributes=attr, progress_callback=upload_callback
+                chat_id, input_file, caption=caption, parse_mode="html", attributes=attr
             )
         else:
             attr = [DocumentAttributeVideo(duration=duration, w=0, h=0, supports_streaming=True)]
             await client.send_file(
-                chat_id, file_path, caption=caption, parse_mode="html",
-                attributes=attr, supports_streaming=True, progress_callback=upload_callback
+                chat_id, input_file, caption=caption, parse_mode="html",
+                attributes=attr, supports_streaming=True
             )
 
         # HAPUS FILE SEGERA SETELAH DIUNGGAH KE USER
