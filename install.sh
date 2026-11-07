@@ -116,8 +116,11 @@ else
     cat > "$ENV_FILE" <<EOF
 # Dibuat otomatis oleh install.sh — $(date '+%Y-%m-%d %H:%M:%S')
 BOT_TOKEN=$TOKEN
+API_ID=33432678
+API_HASH=e272c0676a332ac9be9d721c875d870a
 ALLOWED_USER_IDS=$ALLOWED
-DOWNLOAD_DIR=/tmp/tg_media_downloader
+DOWNLOAD_DIR=/opt/telegram-media-downloader/downloads
+MAX_UPLOAD_MB=1000
 EOF
     chmod 600 "$ENV_FILE"
     log ".env ditulis: $ENV_FILE (permission 600)"

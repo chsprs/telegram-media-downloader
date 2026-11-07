@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Telegram Media Downloader Bot — full GUI flow (inline keyboard).
+Telegram Media Downloader Bot — MTProto Engine (Telethon)
+Mendukung unduhan media besar hingga 1-2 GB natively via Telegram MTProto.
 
 Alur:
   1. /start          -> kartu menu
-  2. kirim link      -> probe metadata, kartu info + thumbnail
+  2. kirim link      -> probe metadata di thread pool, kartu info + thumbnail
   3. pilih format    -> tombol video (1080/720/480/terbaik) & audio (MP3 320/192/128)
   4. approval        -> kartu konfirmasi (judul, durasi, format, estimasi size)
-  5. unduh           -> progress bar live -> kirim file -> bersihkan disk
-
-Ringan untuk ARM SBC / STB (yt-dlp + pyTelegramBotAPI).
+  5. unduh           -> progress bar live -> streaming upload MTProto -> bersihkan disk
 """
 
 import os
@@ -20,14 +19,15 @@ import glob
 import html
 import shutil
 import logging
+import asyncio
 import threading
 import urllib.request
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-import telebot
-from telebot import types
+from telethon import TelegramClient, events, Button
+from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
 import yt_dlp
 
 # --- Logging ---
@@ -51,37 +51,41 @@ def load_dotenv(filepath=".env"):
 load_dotenv()
 
 # --- Config ---
+API_ID = int(os.getenv("API_ID", "33432678"))
+API_HASH = os.getenv("API_HASH", "e272c0676a332ac9be9d721c875d870a")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 if not BOT_TOKEN and __name__ == "__main__":
     logger.error("BOT_TOKEN tidak ditemukan! Set di file .env")
     sys.exit(1)
 
-token_to_init = BOT_TOKEN if BOT_TOKEN and ":" in BOT_TOKEN else "123456:dummy_test_token"
-bot = telebot.TeleBot(token_to_init, parse_mode="HTML")
-
-# Upload 50 MB di STB lambat: default read timeout 25s bikin ReadTimeout di tengah kirim.
-telebot.apihelper.READ_TIMEOUT = int(os.getenv("TELEGRAM_READ_TIMEOUT", "300"))
-
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USER_IDS", "").strip()
 ALLOWED_USERS = set(int(uid.strip()) for uid in ALLOWED_USERS_RAW.split(",") if uid.strip().isdigit())
 
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/tg_media_downloader")
+# Gunakan direktori di disk eMMC, bukan /tmp (karena tmpfs RAM cuma 895MB di HG680P)
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/opt/telegram-media-downloader/downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-MAX_UPLOAD_MB = max(1, int(os.getenv("MAX_UPLOAD_MB", "50")))
-MAX_TELEGRAM_FILESIZE = MAX_UPLOAD_MB * 1024 * 1024  # default aman 50 MB; Bot API terima lebih
+# Batas upload default 1000 MB (1 GB), MTProto mendukung hingga 2000 MB
+MAX_UPLOAD_MB = max(1, int(os.getenv("MAX_UPLOAD_MB", "1000")))
+MAX_TELEGRAM_FILESIZE = MAX_UPLOAD_MB * 1024 * 1024
 URL_REGEX = re.compile(r"https?://[^\s]+")
 
-# ThreadPool bounded: STB ARM (HG680P) CPU lemah, jangan biarkan banyak yt-dlp jalan bareng.
+# ThreadPool bounded: STB ARM (HG680P) CPU lemah, batasi unduhan paralel
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
 _pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS)
 
-# Disk guard: eMMC umur pendek, jangan biarkan penuh sampai 95%+ (data rusak / crash).
+# Disk guard: sisa disk minimum (MB) sebelum unduhan ditolak
 MIN_FREE_DISK_MB = int(os.getenv("MIN_FREE_DISK_MB", "512"))
 
-# Storage hygiene: buang sisa unduhan basi tiap interval + saat startup.
+# Storage hygiene
 PRUNE_MAX_AGE_SECONDS = int(os.getenv("PRUNE_MAX_AGE_SECONDS", "3600"))
 PRUNE_INTERVAL_SECONDS = int(os.getenv("PRUNE_INTERVAL_SECONDS", "1800"))
+
+# Inisialisasi TelegramClient Telethon
+session_dir = os.path.dirname(os.path.abspath(__file__))
+session_path = os.getenv("TELETHON_SESSION", os.path.join(session_dir, "bot_session"))
+client = TelegramClient(session_path, API_ID, API_HASH)
 
 FORMAT_LABEL = {
     "v1080": "🎬 Video 1080p (MP4)",
@@ -105,7 +109,7 @@ AUDIO_KBPS = {"a320": 320, "a192": 192, "a128": 128}
 
 # --- Helpers ---
 class LRUCache(OrderedDict):
-    """Cache in-memory: callback_data Telegram maksimal 64 byte."""
+    """Cache in-memory untuk status request."""
 
     def __init__(self, capacity=200):
         super().__init__()
@@ -159,8 +163,6 @@ def progress_bar(pct: float, width: int = 14) -> str:
 
 
 def new_req_id() -> str:
-    # uuid, bukan timestamp: dua request pada milidetik sama tidak boleh menabrak
-    # (job_cache tertimpa + cleanup() menghapus file milik user lain).
     return uuid.uuid4().hex[:10]
 
 
@@ -177,8 +179,6 @@ def head_size(url) -> int:
 
 
 # --- yt-dlp ---
-# TikTok/SNS sering balas halaman tanpa blob rehydration atau 429 sesaat: satu percobaan gagal
-# bukan berarti link rusak, jadi ulangi dengan backoff sebelum menyerah.
 TRANSIENT_MARKERS = (
     "unable to extract", "unexpected response", "timed out", "timeout",
     "429", "too many requests", "temporarily", "connection reset",
@@ -266,7 +266,6 @@ def estimate_sizes(info: dict) -> dict:
         est["vbest"] = int(approx)
 
     if not est:
-        # Link langsung (tanpa daftar format) — coba HEAD request untuk Content-Length
         size = head_size(info.get("url") or info.get("webpage_url"))
         if size:
             est["vbest"] = size
@@ -311,7 +310,7 @@ def download_media(url: str, mode: str, req_id: str, on_progress=None) -> str:
     ]
     if not files:
         raise yt_dlp.utils.DownloadError("File hasil unduhan tidak ditemukan.")
-    # hasil merge/postprocess = file terbesar; jangan ambil sisa stream audio/webm
+    # Ambil file terbesar (hasil final merge)
     return max(files, key=os.path.getsize)
 
 
@@ -323,9 +322,7 @@ def cleanup(req_id: str):
             pass
 
 
-# req_id yang masih diproses: jangan sampai pruner menghapus file unduhan yang hidup.
 _active = set()
-# user yang sedang di-probe: cegah satu user membanjiri antrean pool.
 _probes_inflight = set()
 
 
@@ -363,7 +360,6 @@ def download_guard(cancel: threading.Event, why: dict):
     if cancel is not None and cancel.is_set():
         why["why"] = "user"
         raise DownloadCancelled("dibatalkan pengguna")
-    # hook yt-dlp dipanggil ratusan kali/detik: cek disk maksimal tiap 2 detik.
     now = time.time()
     if now - _guard_disk_ts[0] < 2.0:
         return
@@ -387,7 +383,7 @@ def disk_check(est_bytes: int) -> str:
     )
 
 
-# --- UI builders ---
+# --- UI builders (Telethon Button) ---
 def card_caption(job: dict) -> str:
     title = html.escape(str(job.get("title") or "Tanpa judul")[:120])
     uploader = html.escape(str(job.get("uploader") or "—")[:60])
@@ -403,7 +399,7 @@ def card_caption(job: dict) -> str:
     return "\n".join(lines)
 
 
-def format_keyboard(req_id: str, est: dict) -> types.InlineKeyboardMarkup:
+def format_keyboard(req_id: str, est: dict):
     def label(mode, base):
         size = est.get(mode)
         if size:
@@ -411,22 +407,26 @@ def format_keyboard(req_id: str, est: dict) -> types.InlineKeyboardMarkup:
             return f"{base} · {human_size(size)}{mark}"
         return base
 
-    mk = types.InlineKeyboardMarkup(row_width=2)
-    mk.add(
-        types.InlineKeyboardButton(label("v1080", "🎬 1080p"), callback_data=f"f:v1080:{req_id}"),
-        types.InlineKeyboardButton(label("v720", "🎬 720p"), callback_data=f"f:v720:{req_id}"),
-    )
-    mk.add(
-        types.InlineKeyboardButton(label("v480", "🎬 480p"), callback_data=f"f:v480:{req_id}"),
-        types.InlineKeyboardButton(label("vbest", "🎬 Terbaik"), callback_data=f"f:vbest:{req_id}"),
-    )
-    mk.add(
-        types.InlineKeyboardButton(label("a320", "🎵 MP3 320"), callback_data=f"f:a320:{req_id}"),
-        types.InlineKeyboardButton(label("a192", "🎵 MP3 192"), callback_data=f"f:a192:{req_id}"),
-    )
-    mk.add(types.InlineKeyboardButton(label("a128", "🎵 MP3 128"), callback_data=f"f:a128:{req_id}"))
-    mk.add(types.InlineKeyboardButton("❌ Batalkan", callback_data=f"x:{req_id}"))
-    return mk
+    return [
+        [
+            Button.inline(label("v1080", "🎬 1080p"), f"f:v1080:{req_id}"),
+            Button.inline(label("v720", "🎬 720p"), f"f:v720:{req_id}"),
+        ],
+        [
+            Button.inline(label("v480", "🎬 480p"), f"f:v480:{req_id}"),
+            Button.inline(label("vbest", "🎬 Terbaik"), f"f:vbest:{req_id}"),
+        ],
+        [
+            Button.inline(label("a320", "🎵 MP3 320"), f"f:a320:{req_id}"),
+            Button.inline(label("a192", "🎵 MP3 192"), f"f:a192:{req_id}"),
+        ],
+        [
+            Button.inline(label("a128", "🎵 MP3 128"), f"f:a128:{req_id}"),
+        ],
+        [
+            Button.inline("❌ Batalkan", f"x:{req_id}"),
+        ],
+    ]
 
 
 def approval_caption(job: dict, mode: str) -> str:
@@ -449,173 +449,148 @@ def approval_caption(job: dict, mode: str) -> str:
         "",
     ]
     if est and est > MAX_TELEGRAM_FILESIZE:
-        lines.append("⚠️ <i>Estimasi melebihi limit 50 MB. Unduhan bisa gagal.</i>")
+        lines.append(f"⚠️ <i>Estimasi melebihi batas {human_size(MAX_TELEGRAM_FILESIZE)}. Unduhan bisa gagal.</i>")
     else:
         lines.append("<i>Lanjutkan unduhan?</i>")
     return "\n".join(lines)
 
 
-def approval_keyboard(req_id: str, mode: str) -> types.InlineKeyboardMarkup:
-    mk = types.InlineKeyboardMarkup(row_width=2)
-    mk.add(
-        types.InlineKeyboardButton("✅ Setujui & Unduh", callback_data=f"ok:{mode}:{req_id}"),
-        types.InlineKeyboardButton("🔙 Ganti Format", callback_data=f"back:{req_id}"),
-    )
-    mk.add(types.InlineKeyboardButton("❌ Batal", callback_data=f"x:{req_id}"))
-    return mk
+def approval_keyboard(req_id: str, mode: str):
+    return [
+        [Button.inline("✅ Setujui & Unduh", f"ok:{mode}:{req_id}")],
+        [Button.inline("🔙 Ganti Format", f"back:{req_id}"), Button.inline("❌ Batal", f"x:{req_id}")],
+    ]
 
 
-def menu_keyboard() -> types.InlineKeyboardMarkup:
-    mk = types.InlineKeyboardMarkup(row_width=2)
-    mk.add(
-        types.InlineKeyboardButton("🔗 Kirim Link", callback_data="menu:link"),
-        types.InlineKeyboardButton("ℹ️ Cara Pakai", callback_data="menu:help"),
-    )
-    mk.add(types.InlineKeyboardButton("📊 Status Bot", callback_data="menu:status"))
-    return mk
+def menu_keyboard():
+    return [
+        [Button.inline("🔗 Kirim Link", "menu:link"), Button.inline("ℹ️ Cara Pakai", "menu:help")],
+        [Button.inline("📊 Status Bot", "menu:status")],
+    ]
 
 
-def edit_card(chat_id: int, msg_id: int, text: str, markup=None, is_photo=True):
-    """Edit caption kalau kartu foto, fallback ke edit text."""
-    if is_photo:
-        try:
-            bot.edit_message_caption(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup)
-            return True
-        except Exception:
-            pass
+def menu_markup():
+    return [[Button.inline("🏠 Menu", "menu:help")]]
+
+
+def stop_keyboard(req_id: str):
+    return [[Button.inline("⏹ Batalkan unduhan", f"stop:{req_id}")]]
+
+
+async def edit_card(chat_id: int, msg_id: int, text: str, buttons=None):
     try:
-        bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup,
-                              disable_web_page_preview=True)
+        await client.edit_message(chat_id, msg_id, text=text, buttons=buttons, parse_mode="html", link_preview=False)
         return True
-    except Exception:
+    except Exception as e:
+        logger.debug("edit_card gagal: %s", e)
         return False
 
 
-def send_card(chat_id: int, caption: str, markup, thumb=None):
-    """Kirim kartu (foto + caption) atau fallback text. Return (message_id, is_photo)."""
+async def send_card(chat_id: int, caption: str, buttons, thumb=None) -> int:
     if thumb:
         try:
-            msg = bot.send_photo(chat_id, thumb, caption=caption, reply_markup=markup)
-            return msg.message_id, True
+            msg = await client.send_file(chat_id, thumb, caption=caption, buttons=buttons, parse_mode="html")
+            return msg.id
         except Exception:
             pass
-    msg = bot.send_message(chat_id, caption, reply_markup=markup, disable_web_page_preview=True)
-    return msg.message_id, False
+    msg = await client.send_message(chat_id, caption, buttons=buttons, parse_mode="html", link_preview=False)
+    return msg.id
 
 
-def update_card(job: dict, text: str, markup=None):
-    """Ubah kartu asal (kartu format/approval) jadi status akhir."""
+async def update_card(job: dict, text: str, buttons=None):
     msg_id = job.get("card_msg_id")
     if not msg_id:
         return
-    edit_card(job["chat_id"], msg_id, text, markup, bool(job.get("card_is_photo")))
-
-
-def menu_markup() -> types.InlineKeyboardMarkup:
-    return types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("🏠 Menu", callback_data="menu:help"))
-
-
-def stop_keyboard(req_id: str) -> types.InlineKeyboardMarkup:
-    return types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("⏹ Batalkan unduhan", callback_data=f"stop:{req_id}"))
+    await edit_card(job["chat_id"], msg_id, text, buttons)
 
 
 # --- Handlers ---
 WELCOME = (
-    "<b>📥 Telegram Media Downloader</b>\n\n"
+    "<b>📥 Telegram Media Downloader (MTProto Engine)</b>\n\n"
     "Unduh video / audio dari TikTok, Instagram, YouTube, X/Twitter, "
     "Facebook, SoundCloud, Reddit, dan 1000+ situs lain.\n\n"
     "<b>Alur:</b>\n"
     "1️⃣ Klik <i>Kirim Link</i> lalu kirim URL\n"
     "2️⃣ Pilih format (video / audio)\n"
     "3️⃣ Setujui unduhan\n\n"
-    f"⚠️ Batas file: <b>{human_size(MAX_TELEGRAM_FILESIZE)}</b> (limit Bot API)"
+    f"📦 Batas file: <b>{human_size(MAX_TELEGRAM_FILESIZE)}</b> (didukung MTProto s.d 2 GB)"
 )
 
 
-def _deny(chat_id: int, user_id: int):
-    bot.send_message(chat_id, f"🚫 Akses ditolak.\nUser ID Anda: <code>{user_id}</code>")
-
-
-@bot.message_handler(commands=["start", "help"])
-def cmd_start(message: types.Message):
-    if not is_authorized(message.from_user.id):
-        _deny(message.chat.id, message.from_user.id)
+@client.on(events.NewMessage(pattern=r"^/(start|help)"))
+async def cmd_start(event):
+    user_id = event.sender_id
+    if not is_authorized(user_id):
+        await event.reply(f"🚫 Akses ditolak.\nUser ID Anda: <code>{user_id}</code>", parse_mode="html")
         return
-    bot.reply_to(message, WELCOME, reply_markup=menu_keyboard(), disable_web_page_preview=True)
+    await event.reply(WELCOME, buttons=menu_keyboard(), parse_mode="html", link_preview=False)
 
 
-@bot.message_handler(commands=["ping"])
-def cmd_ping(message: types.Message):
+@client.on(events.NewMessage(pattern=r"^/ping"))
+async def cmd_ping(event):
     t0 = time.time()
-    msg = bot.reply_to(message, "Pong...")
-    latency = (time.time() - t0) * 1000
-    bot.edit_message_text(f"🏓 Pong! Latensi: <b>{latency:.0f} ms</b>",
-                          chat_id=msg.chat.id, message_id=msg.message_id)
+    msg = await event.reply("Pong...")
+    lat = (time.time() - t0) * 1000
+    await msg.edit(f"🏓 Pong! Latensi: <b>{lat:.0f} ms</b>", parse_mode="html")
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("menu:"))
-def handle_menu(call: types.CallbackQuery):
-    action = call.data.split(":", 1)[1]
-    bot.answer_callback_query(call.id)
+@client.on(events.CallbackQuery(pattern=r"^menu:"))
+async def handle_menu(event):
+    data = event.data.decode("utf-8")
+    action = data.split(":", 1)[1]
+    await event.answer()
+    chat_id = event.chat_id
 
     if action == "link":
-        bot.send_message(call.message.chat.id, "🔗 Silakan kirim link video/audio sekarang.")
+        await client.send_message(chat_id, "🔗 Silakan kirim link video/audio sekarang.")
     elif action == "help":
-        bot.send_message(call.message.chat.id, WELCOME, reply_markup=menu_keyboard(),
-                         disable_web_page_preview=True)
+        await client.send_message(chat_id, WELCOME, buttons=menu_keyboard(), parse_mode="html", link_preview=False)
     elif action == "status":
+        free_disk = shutil.disk_usage(DOWNLOAD_DIR).free
         text = (
-            "📊 <b>Status Bot</b>\n\n"
-            "🟢 Aktif\n"
+            "📊 <b>Status Bot (MTProto Engine)</b>\n\n"
+            "🟢 Aktif (Telethon MTProto Native)\n"
             f"🧠 Sesi aktif: <b>{len(job_cache)}</b>\n"
-            f"💾 Folder temp: <code>{DOWNLOAD_DIR}</code>\n"
-            f"📦 Limit file: <b>{human_size(MAX_TELEGRAM_FILESIZE)}</b>"
+            f"💾 Folder unduhan: <code>{DOWNLOAD_DIR}</code>\n"
+            f"💽 Sisa disk: <b>{human_size(free_disk)}</b>\n"
+            f"📦 Batas upload: <b>{human_size(MAX_TELEGRAM_FILESIZE)}</b>"
         )
-        bot.send_message(call.message.chat.id, text)
+        await client.send_message(chat_id, text, parse_mode="html")
 
 
-@bot.message_handler(func=lambda m: True)
-def handle_link(message: types.Message):
-    if not is_authorized(message.from_user.id):
-        _deny(message.chat.id, message.from_user.id)
+@client.on(events.NewMessage(func=lambda e: not (e.raw_text or "").startswith("/")))
+async def handle_link(event):
+    user_id = event.sender_id
+    if not is_authorized(user_id):
+        await event.reply(f"🚫 Akses ditolak.\nUser ID Anda: <code>{user_id}</code>", parse_mode="html")
         return
 
-    match = URL_REGEX.search(message.text or "")
+    match = URL_REGEX.search(event.raw_text or "")
     if not match:
-        bot.reply_to(
-            message,
-            "⚠️ Kirim link yang valid (diawali <code>http://</code> atau <code>https://</code>).",
-            reply_markup=menu_keyboard(),
-        )
         return
 
     url = match.group(0).rstrip(".,);:!?\"'”’>")
-
-    user_id = message.from_user.id
     if user_id in _probes_inflight:
-        bot.reply_to(message, "⏳ Masih memproses permintaan sebelumnya. Tunggu sampai kartunya muncul.")
+        await event.reply("⏳ Masih memproses permintaan sebelumnya. Tunggu sampai kartunya muncul.")
         return
 
-    probe_msg = bot.reply_to(message, "🔍 Mengambil info media...")
+    probe_msg = await event.reply("🔍 Mengambil info media...")
     _probes_inflight.add(user_id)
-    # yt-dlp 10-30s: jangan blok thread polling, kalau tidak bot beku untuk semua user.
-    _pool.submit(_probe_and_send, message.chat.id, user_id, url, probe_msg)
+    asyncio.create_task(_probe_and_send(event.chat_id, user_id, url, probe_msg.id))
 
 
-def _probe_and_send(chat_id: int, user_id: int, url: str, probe_msg):
+async def _probe_and_send(chat_id: int, user_id: int, url: str, probe_msg_id: int):
+    loop = asyncio.get_running_loop()
     try:
         try:
-            info = probe(url)
+            info = await loop.run_in_executor(_pool, probe, url)
         except Exception as e:
             logger.warning("probe gagal: %s", e)
-            bot.edit_message_text(
-                "❌ Gagal membaca link.\n<code>{}</code>\n\n"
-                "Pastikan link publik (bukan private/login-only).".format(html.escape(str(e)[:200])),
-                chat_id=probe_msg.chat.id,
-                message_id=probe_msg.message_id,
+            err_text = (
+                f"❌ Gagal membaca link.\n<code>{html.escape(str(e)[:200])}</code>\n\n"
+                "Pastikan link publik (bukan private/login-only)."
             )
+            await client.edit_message(chat_id, probe_msg_id, err_text, parse_mode="html")
             return
 
         req_id = new_req_id()
@@ -633,19 +608,18 @@ def _probe_and_send(chat_id: int, user_id: int, url: str, probe_msg):
         job_cache.set(req_id, job)
 
         try:
-            bot.delete_message(probe_msg.chat.id, probe_msg.message_id)
+            await client.delete_messages(chat_id, probe_msg_id)
         except Exception:
             pass
 
-        job["card_msg_id"], job["card_is_photo"] = send_card(
-            chat_id, card_caption(job), format_keyboard(req_id, job["est"]), thumb=job.get("thumb"))
+        job["card_msg_id"] = await send_card(
+            chat_id, card_caption(job), format_keyboard(req_id, job["est"]), thumb=job.get("thumb")
+        )
     except Exception as e:
         logger.exception("probe worker error")
         try:
-            bot.edit_message_text(
-                "❌ <b>Error internal</b>\n<code>{}</code>".format(html.escape(str(e)[:150])),
-                chat_id=probe_msg.chat.id,
-                message_id=probe_msg.message_id,
+            await client.edit_message(
+                chat_id, probe_msg_id, f"❌ <b>Error internal</b>\n<code>{html.escape(str(e)[:150])}</code>", parse_mode="html"
             )
         except Exception:
             pass
@@ -653,37 +627,38 @@ def _probe_and_send(chat_id: int, user_id: int, url: str, probe_msg):
         _probes_inflight.discard(user_id)
 
 
-@bot.callback_query_handler(func=lambda c: c.data.split(":")[0] in ("f", "back", "ok", "x", "stop"))
-def handle_flow(call: types.CallbackQuery):
-    if not is_authorized(call.from_user.id):
-        bot.answer_callback_query(call.id, "Akses ditolak.", show_alert=True)
-        return
-
-    parts = call.data.split(":")
+@client.on(events.CallbackQuery(pattern=r"^(f|back|ok|x|stop):"))
+async def handle_flow(event):
+    data = event.data.decode("utf-8")
+    parts = data.split(":")
     action = parts[0]
-    chat_id = call.message.chat.id
-    msg_id = call.message.message_id
-    is_photo = bool(call.message.photo)
+    user_id = event.sender_id
+    chat_id = event.chat_id
+    msg_id = event.message_id
+
+    if not is_authorized(user_id):
+        await event.answer("Akses ditolak.", alert=True)
+        return
 
     if action == "f":
         _, mode, req_id = parts
         job = job_cache.get(req_id)
         if not job:
-            bot.answer_callback_query(call.id, "Sesi kedaluwarsa. Kirim ulang link.", show_alert=True)
+            await event.answer("Sesi kedaluwarsa. Kirim ulang link.", alert=True)
             return
         job["mode"] = mode
-        bot.answer_callback_query(call.id, f"Format: {FORMAT_LABEL.get(mode, mode)}")
-        edit_card(chat_id, msg_id, approval_caption(job, mode), approval_keyboard(req_id, mode), is_photo)
+        await event.answer(f"Format: {FORMAT_LABEL.get(mode, mode)}")
+        await edit_card(chat_id, msg_id, approval_caption(job, mode), approval_keyboard(req_id, mode))
         return
 
     if action == "back":
         req_id = parts[1]
         job = job_cache.get(req_id)
         if not job:
-            bot.answer_callback_query(call.id, "Sesi kedaluwarsa. Kirim ulang link.", show_alert=True)
+            await event.answer("Sesi kedaluwarsa. Kirim ulang link.", alert=True)
             return
-        bot.answer_callback_query(call.id, "Pilih format lain.")
-        edit_card(chat_id, msg_id, card_caption(job), format_keyboard(req_id, job["est"]), is_photo)
+        await event.answer("Pilih format lain.")
+        await edit_card(chat_id, msg_id, card_caption(job), format_keyboard(req_id, job["est"]))
         return
 
     if action == "x":
@@ -692,14 +667,13 @@ def handle_flow(call: types.CallbackQuery):
         cancel = job.get("cancel")
         if cancel is not None:
             cancel.set()
-        cleanup(req_id)  # buang sisa file kalau user batal setelah unduhan mulai
-        bot.answer_callback_query(call.id, "Dibatalkan.")
+        cleanup(req_id)
+        await event.answer("Dibatalkan.")
         title = html.escape(str(job.get("title") or "Tanpa judul")[:120])
-        edit_card(
+        await edit_card(
             chat_id, msg_id,
             f"❌ <b>Dibatalkan</b>\n\n📌 {title}\n\nKirim link baru kalau mau unduh lagi.",
             menu_markup(),
-            is_photo,
         )
         return
 
@@ -707,45 +681,43 @@ def handle_flow(call: types.CallbackQuery):
         req_id = parts[1]
         job = job_cache.get(req_id)
         if not job or not job.get("cancel"):
-            bot.answer_callback_query(call.id, "Unduhan sudah selesai / tidak aktif.")
+            await event.answer("Unduhan sudah selesai / tidak aktif.")
             return
         job["cancel"].set()
-        bot.answer_callback_query(call.id, "⏹ Menghentikan unduhan...")
+        await event.answer("⏹ Menghentikan unduhan...")
         return
 
     if action == "ok":
         _, mode, req_id = parts
         job = job_cache.get(req_id)
         if not job:
-            bot.answer_callback_query(call.id, "Sesi kedaluwarsa. Kirim ulang link.", show_alert=True)
+            await event.answer("Sesi kedaluwarsa. Kirim ulang link.", alert=True)
             return
         if job.get("busy"):
-            bot.answer_callback_query(call.id, "Unduhan ini sedang berjalan.", show_alert=True)
+            await event.answer("Unduhan ini sedang berjalan.", alert=True)
             return
         job["busy"] = True
         warn = disk_check(job.get("est", {}).get(mode) or 0)
         if warn:
             job["busy"] = False
-            bot.answer_callback_query(call.id, "Ruang disk tidak cukup.", show_alert=True)
-            update_card(job, warn, menu_markup())
+            await event.answer("Ruang disk tidak cukup.", alert=True)
+            await update_card(job, warn, menu_markup())
             return
-        bot.answer_callback_query(call.id, "✅ Disetujui, mulai unduh...")
-        edit_card(chat_id, msg_id,
-                  f"⏳ <b>Menyiapkan unduhan...</b>\n\n{FORMAT_LABEL.get(mode, mode)}", None, is_photo)
-        # Jangan blok polling thread: yt-dlp + upload bisa menit-an.
-        _pool.submit(run_download, chat_id, req_id, job, mode)
+        await event.answer("✅ Disetujui, mulai unduh...")
+        await edit_card(chat_id, msg_id, f"⏳ <b>Menyiapkan unduhan...</b>\n\n{FORMAT_LABEL.get(mode, mode)}", None)
+        asyncio.create_task(run_download(chat_id, req_id, job, mode))
 
 
-def run_download(chat_id: int, req_id: str, job: dict, mode: str):
+async def run_download(chat_id: int, req_id: str, job: dict, mode: str):
     title_html = html.escape(str(job.get("title") or "")[:90])
     label = FORMAT_LABEL.get(mode, mode)
-    est_size = job.get("est", {}).get(mode) or 0
-
-    bar_msg = bot.send_message(chat_id, "⏳ Memulai...", reply_markup=stop_keyboard(req_id))
+    bar_msg = await client.send_message(chat_id, "⏳ Memulai...", buttons=stop_keyboard(req_id))
     state = {"last": 0.0, "last_text": ""}
     cancel = job.setdefault("cancel", threading.Event())
     why = {}
     _active.add(req_id)
+
+    loop = asyncio.get_running_loop()
 
     def on_progress(d):
         download_guard(cancel, why)
@@ -768,14 +740,10 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
             if text == state.get("last_text"):
                 return
             state["last_text"] = text
-            try:
-                bot.edit_message_text(
-                    text,
-                    chat_id=chat_id,
-                    message_id=bar_msg.message_id,
-                )
-            except Exception:
-                pass
+            asyncio.run_coroutine_threadsafe(
+                client.edit_message(chat_id, bar_msg.id, text, buttons=stop_keyboard(req_id), parse_mode="html"),
+                loop,
+            )
         elif d.get("status") == "finished":
             text = (
                 f"🔄 <b>Memproses file...</b>\n{title_html}\n\n"
@@ -784,139 +752,151 @@ def run_download(chat_id: int, req_id: str, job: dict, mode: str):
             if text == state.get("last_text"):
                 return
             state["last_text"] = text
-            try:
-                bot.edit_message_text(
-                    text,
-                    chat_id=chat_id,
-                    message_id=bar_msg.message_id,
-                )
-            except Exception:
-                pass
+            asyncio.run_coroutine_threadsafe(
+                client.edit_message(chat_id, bar_msg.id, text, buttons=stop_keyboard(req_id), parse_mode="html"),
+                loop,
+            )
 
     try:
-        file_path = download_media(job["url"], mode, req_id, on_progress=on_progress)
-        if cancel.is_set():  # hook yt-dlp bisa saja tertelan; cek sekali lagi
+        file_path = await loop.run_in_executor(_pool, download_media, job["url"], mode, req_id, on_progress)
+        if cancel.is_set():
             raise DownloadCancelled("dibatalkan pengguna")
-        size = os.path.getsize(file_path)
 
+        size = os.path.getsize(file_path)
         if size > MAX_TELEGRAM_FILESIZE:
-            bot.edit_message_text(
-                f"❌ <b>File terlalu besar</b>\n{human_size(size)} melebihi limit "
-                f"{human_size(MAX_TELEGRAM_FILESIZE)}.\n\nCoba format lebih kecil (mis. 480p atau MP3 128).",
-                chat_id=chat_id,
-                message_id=bar_msg.message_id,
+            await client.edit_message(
+                chat_id, bar_msg.id,
+                f"❌ <b>File terlalu besar</b>\n{human_size(size)} melebihi batas {human_size(MAX_TELEGRAM_FILESIZE)}.\n\nCoba format lebih kecil.",
+                parse_mode="html",
             )
-            # Update origin card to failed
-            update_card(job, f"❌ <b>Gagal</b>\n\n📌 {title_html}\n\nFile terlalu besar ({human_size(size)}).\n\nKirim link baru.", menu_markup())
+            await update_card(job, f"❌ <b>Gagal</b>\n\n📌 {title_html}\n\nFile terlalu besar ({human_size(size)}).\n\nKirim link baru.", menu_markup())
             return
 
-        bot.edit_message_text(
-            f"📤 <b>Mengunggah ke Telegram...</b>\n{title_html}\n💾 {human_size(size)}",
-            chat_id=chat_id,
-            message_id=bar_msg.message_id,
+        await client.edit_message(
+            chat_id, bar_msg.id,
+            f"📤 <b>Mengunggah ke Telegram (MTProto)...</b>\n{title_html}\n💾 {human_size(size)}",
+            parse_mode="html",
         )
 
         caption = f"<b>{title_html}</b>\n{label}"
         duration = int(job.get("duration") or 0)
 
-        with open(file_path, "rb") as fh:
-            if mode.startswith("a"):
-                raw_title = str(job.get("title") or "")
-                audio_title = " ".join(raw_title.split())[:60]
-                bot.send_audio(chat_id, fh, caption=caption,
-                               title=audio_title, duration=duration or None)
-            else:
-                bot.send_video(chat_id, fh, caption=caption, duration=duration or None,
-                               supports_streaming=True)
+        # Upload progress callback
+        last_up = [0.0]
 
-        # File sudah terkirim ke user -> hapus dari penyimpanan bot
+        def upload_callback(current, total):
+            now = time.time()
+            if now - last_up[0] < 3:
+                return
+            last_up[0] = now
+            pct = (current / total * 100) if total else 0
+            up_text = (
+                f"📤 <b>Mengunggah ke Telegram (MTProto)...</b>\n{title_html}\n\n"
+                f"<code>{progress_bar(pct)}</code> {pct:5.1f}%\n"
+                f"📦 {human_size(current)} / {human_size(total)}"
+            )
+            asyncio.run_coroutine_threadsafe(
+                client.edit_message(chat_id, bar_msg.id, up_text, parse_mode="html"),
+                loop,
+            )
+
+        if mode.startswith("a"):
+            raw_title = str(job.get("title") or "")
+            audio_title = " ".join(raw_title.split())[:60]
+            attr = [DocumentAttributeAudio(duration=duration, title=audio_title, performer=str(job.get("uploader") or ""))]
+            await client.send_file(
+                chat_id, file_path, caption=caption, parse_mode="html",
+                attributes=attr, progress_callback=upload_callback
+            )
+        else:
+            attr = [DocumentAttributeVideo(duration=duration, w=0, h=0, supports_streaming=True)]
+            await client.send_file(
+                chat_id, file_path, caption=caption, parse_mode="html",
+                attributes=attr, supports_streaming=True, progress_callback=upload_callback
+            )
+
+        # HAPUS FILE SEGERA SETELAH DIUNGGAH KE USER
         try:
             os.remove(file_path)
-            logger.info("file terkirim & dihapus: %s", file_path)
+            logger.info("file terkirim & langsung dihapus dari disk: %s", file_path)
         except OSError as e:
             logger.warning("gagal hapus %s: %s", file_path, e)
 
         try:
-            bot.delete_message(chat_id, bar_msg.message_id)
+            await client.delete_messages(chat_id, bar_msg.id)
         except Exception:
             pass
 
-        # Update origin card jadi sukses
+        # Update kartu asal jadi sukses
         text = (
             f"✅ <b>Terkirim</b>\n\n"
             f"📌 {title_html}\n{label}\n💾 {human_size(size)}\n\n"
             f"Kirim link baru untuk unduh lagi."
         )
-        update_card(job, text, menu_markup())
+        await update_card(job, text, menu_markup())
 
     except DownloadCancelled:
         reason = why.get("why", "user")
-        title_html = html.escape(str(job.get("title") or "")[:90])
         if reason == "disk":
-            bot.edit_message_text(
-                f"❌ <b>Disk penuh</b>\nHapus file lain dulu.\n\n📌 {title_html}",
-                chat_id=chat_id, message_id=bar_msg.message_id)
-            update_card(job, f"❌ <b>Gagal</b>\n\n📌 {title_html}\n\nDisk hampir penuh.", menu_markup())
+            await client.edit_message(
+                chat_id, bar_msg.id, f"❌ <b>Disk penuh</b>\n\n📌 {title_html}", parse_mode="html"
+            )
+            await update_card(job, f"❌ <b>Gagal</b>\n\n📌 {title_html}\n\nDisk hampir penuh.", menu_markup())
         else:
-            bot.edit_message_text(
-                f"⏹ <b>Dibatalkan</b>\n\n📌 {title_html}\n\nKirim link baru kalau mau unduh lagi.",
-                chat_id=chat_id, message_id=bar_msg.message_id)
-            update_card(job, f"❌ <b>Dibatalkan</b>\n\n📌 {title_html}\n\nKirim link baru.", menu_markup())
+            await client.edit_message(
+                chat_id, bar_msg.id, f"⏹ <b>Dibatalkan</b>\n\n📌 {title_html}", parse_mode="html"
+            )
+            await update_card(job, f"❌ <b>Dibatalkan</b>\n\n📌 {title_html}\n\nKirim link baru.", menu_markup())
         return
 
     except yt_dlp.utils.DownloadError as e:
         logger.warning("download gagal: %s", e)
         error_txt = str(e)[:150]
-        bot.edit_message_text(
-            f"❌ <b>Gagal mengunduh</b>\n<code>{html.escape(error_txt)}</code>",
-            chat_id=chat_id,
-            message_id=bar_msg.message_id,
+        await client.edit_message(
+            chat_id, bar_msg.id, f"❌ <b>Gagal mengunduh</b>\n<code>{html.escape(error_txt)}</code>", parse_mode="html"
         )
-        # Update origin card to failed
-        update_card(job, f"❌ <b>Gagal</b>\n\n📌 {title_html}\n\n{error_txt}\n\nKirim link baru.", menu_markup())
+        await update_card(job, f"❌ <b>Gagal</b>\n\n📌 {title_html}\n\n{error_txt}\n\nKirim link baru.", menu_markup())
     except Exception as e:
         logger.exception("error tak terduga")
         error_txt = str(e)[:150]
         try:
-            bot.edit_message_text(
-                f"❌ <b>Error internal</b>\n<code>{html.escape(error_txt)}</code>",
-                chat_id=chat_id,
-                message_id=bar_msg.message_id,
+            await client.edit_message(
+                chat_id, bar_msg.id, f"❌ <b>Error internal</b>\n<code>{html.escape(error_txt)}</code>", parse_mode="html"
             )
         except Exception:
             pass
-        # Update origin card to failed
-        update_card(job, f"❌ <b>Error</b>\n\n📌 {title_html}\n\n{error_txt}\n\nKirim link baru.", menu_markup())
+        await update_card(job, f"❌ <b>Error</b>\n\n📌 {title_html}\n\n{error_txt}\n\nKirim link baru.", menu_markup())
     finally:
-        job["busy"] = False  # Enable concurrent next request if needed
+        job["busy"] = False
         cleanup(req_id)
         _active.discard(req_id)
         job_cache.pop(req_id, None)
 
 
 def startup_cleanup() -> int:
-    """Bot baru start = tidak ada unduhan hidup, semua sisa run sebelumnya sampah."""
+    """Bot baru start = tidak ada unduhan hidup, bersihkan semua sisa crash/run sebelumnya."""
     return prune_stale_downloads(0)
 
 
-def _prune_loop():
+async def _prune_loop():
     while True:
-        time.sleep(PRUNE_INTERVAL_SECONDS)
+        await asyncio.sleep(PRUNE_INTERVAL_SECONDS)
         try:
             prune_stale_downloads(PRUNE_MAX_AGE_SECONDS)
         except Exception:
             logger.exception("prune periodik gagal")
 
 
-def main():
-    logger.info("Bot starting (GUI flow)...")
+async def main():
+    logger.info("Bot starting with MTProto Telethon engine (limit %s)...", human_size(MAX_TELEGRAM_FILESIZE))
     pruned = startup_cleanup()
     if pruned:
         logger.info("Startup hygiene: %d file sisa dihapus.", pruned)
-    t = threading.Thread(target=_prune_loop, daemon=True)
-    t.start()
-    bot.infinity_polling(timeout=20, long_polling_timeout=20)
+    asyncio.create_task(_prune_loop())
+    await client.start(bot_token=BOT_TOKEN)
+    logger.info("Telethon MTProto client connected and polling events.")
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

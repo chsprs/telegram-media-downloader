@@ -1,5 +1,7 @@
 # Environment & secrets
 .env
+*.session
+*.session-journal
 
 # Python artifacts
 __pycache__/

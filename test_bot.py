@@ -88,19 +88,25 @@ class TestHelpers(unittest.TestCase):
         self.assertNotIn("v480", est)
 
     def test_keyboards_build(self):
+        def _get_data(b):
+            d = getattr(b, 'data', None) or getattr(getattr(b, 'type', None), 'data', None)
+            return d.decode("utf-8") if isinstance(d, bytes) else str(d)
+
         mk = format_keyboard("12345678", {"v720": 5_000_000})
-        datas = [b.callback_data for row in mk.keyboard for b in row]
+        datas = [_get_data(b) for row in mk for b in row]
         self.assertIn("f:v720:12345678", datas)
         self.assertTrue(all(len(d.encode()) <= 64 for d in datas))
 
         ak = approval_keyboard("12345678", "a192")
-        adatas = [b.callback_data for row in ak.keyboard for b in row]
+        adatas = [_get_data(b) for row in ak for b in row]
         self.assertIn("ok:a192:12345678", adatas)
         self.assertTrue(all(len(d.encode()) <= 64 for d in adatas))
 
-    def test_read_timeout_raised_for_big_uploads(self):
-        import telebot
-        self.assertGreaterEqual(telebot.apihelper.READ_TIMEOUT, 300)
+    def test_mtproto_limit_and_engine(self):
+        from bot import MAX_UPLOAD_MB, MAX_TELEGRAM_FILESIZE, client
+        self.assertGreaterEqual(MAX_UPLOAD_MB, 1000)
+        self.assertEqual(MAX_TELEGRAM_FILESIZE, MAX_UPLOAD_MB * 1024 * 1024)
+        self.assertIsNotNone(client)
 
     def test_disk_check(self):
         from bot import disk_check, MIN_FREE_DISK_MB
@@ -178,7 +184,8 @@ class TestDownloadGuard(unittest.TestCase):
 
 class TestStartupCleanup(unittest.TestCase):
     def test_startup_wipes_all(self):
-        old_file = os.path.join("/tmp/tg_media_downloader", "startup_test_old.mp4")
+        from bot import DOWNLOAD_DIR
+        old_file = os.path.join(DOWNLOAD_DIR, "startup_test_old.mp4")
         # Pastikan ada file dummy lama
         with open(old_file, "wb") as f:
             f.write(b"garbage")
@@ -235,24 +242,25 @@ class TestStartupCleanup(unittest.TestCase):
             B.cleanup(rid)
 
     def test_probe_inflight_released_on_failure(self):
+        import asyncio
         import bot as B
         sent = []
-        real_edit = B.bot.edit_message_text
+        real_edit = B.client.edit_message
         real_probe = B.probe
-        B.bot.edit_message_text = lambda *a, **k: sent.append(a)
-        B.probe = lambda url: (_ for _ in ()).throw(RuntimeError("boom"))
 
-        class M:
-            chat = type("C", (), {"id": 1})()
-            message_id = 2
+        async def fake_edit(*a, **k):
+            sent.append(a)
+
+        B.client.edit_message = fake_edit
+        B.probe = lambda url: (_ for _ in ()).throw(RuntimeError("boom"))
 
         try:
             B._probes_inflight.add(999)
-            B._probe_and_send(1, 999, "u", M())
+            asyncio.run(B._probe_and_send(1, 999, "u", 2))
             self.assertNotIn(999, B._probes_inflight)
             self.assertTrue(sent)
         finally:
-            B.bot.edit_message_text = real_edit
+            B.client.edit_message = real_edit
             B.probe = real_probe
             B._probes_inflight.discard(999)
 
